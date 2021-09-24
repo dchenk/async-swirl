@@ -92,13 +92,13 @@ fn jobs_can_take_a_connection_as_an_argument() -> Fallible<()> {
     use diesel::sql_query;
 
     #[swirl::background_job]
-    fn takes_env_and_conn(_env: &(), conn: &PgConnection) -> Result<(), swirl::PerformError> {
+    fn takes_env_and_conn(_env: &(), conn: &mut PgConnection) -> Result<(), swirl::PerformError> {
         sql_query("SELECT 1").execute(conn)?;
         Ok(())
     }
 
     #[swirl::background_job]
-    fn takes_only_conn(conn: &PgConnection) -> Result<(), swirl::PerformError> {
+    fn takes_only_conn(conn: &mut PgConnection) -> Result<(), swirl::PerformError> {
         sql_query("SELECT 1").execute(conn)?;
         Ok(())
     }

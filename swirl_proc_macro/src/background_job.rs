@@ -174,14 +174,14 @@ impl JobArgs {
                 (Some(_), _, Arg::Env(_)) => {
                     return Err(
                         span.error("Background jobs cannot take references as arguments")
-                            .help("If this argument is a database connection, the type must be `&PgConnection`")
+                            .help("If this argument is a database connection, the type must be `&mut PgConnection`")
                     );
                 }
                 (_, ConnectionArg::None, Arg::Connection(arg)) => connection_arg = arg,
                 (_, _, Arg::Connection(_)) => {
                     return Err(
                         span.error("Multiple database connection arguments")
-                            .help("To take a connection pool as an argument instead of a single connection, use the type `&dyn swirl::db::DieselPoolObj`")
+                            .help("To take a connection pool as an argument instead of a single connection, use the type `deadpool_diesel::postgres::Pool`")
                     );
                 }
                 (_, _, Arg::Normal(pat_type)) => args.push(pat_type),

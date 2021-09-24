@@ -4,7 +4,6 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use crate::db::DieselPoolObj;
 use crate::errors::PerformError;
 use crate::Job;
 
@@ -59,7 +58,11 @@ macro_rules! register_job {
 pub struct JobVTable {
     env_type: TypeId,
     job_type: &'static str,
-    perform: fn(serde_json::Value, &dyn Any, &dyn DieselPoolObj) -> Result<(), PerformError>,
+    perform: fn(
+        serde_json::Value,
+        &dyn Any,
+        deadpool_diesel::postgres::Pool,
+    ) -> Result<(), PerformError>,
 }
 
 inventory::collect!(JobVTable);
@@ -77,11 +80,11 @@ impl JobVTable {
 fn perform_job<T: Job>(
     data: serde_json::Value,
     env: &dyn Any,
-    pool: &dyn DieselPoolObj,
+    pool: deadpool_diesel::postgres::Pool,
 ) -> Result<(), PerformError> {
     let environment = env.downcast_ref().ok_or_else::<PerformError, _>(|| {
         "Incorrect environment type. This should never happen. \
-         Please open an issue at https://github.com/sgrif/swirl/issues/new"
+         Please open an issue at https://github.com/dchenk/swirl/issues/new"
             .into()
     })?;
     let data = serde_json::from_value(data)?;
@@ -98,7 +101,7 @@ impl<Env: 'static> PerformJob<Env> {
         &self,
         data: serde_json::Value,
         env: &Env,
-        pool: &dyn DieselPoolObj,
+        pool: deadpool_diesel::postgres::Pool,
     ) -> Result<(), PerformError> {
         let perform_fn = self.vtable.perform;
         perform_fn(data, env, pool)

@@ -1,7 +1,6 @@
 use diesel::PgConnection;
 use serde::{de::DeserializeOwned, Serialize};
 
-use crate::db::DieselPoolObj;
 use crate::errors::{EnqueueError, PerformError};
 use crate::storage;
 
@@ -18,11 +17,14 @@ pub trait Job: Serialize + DeserializeOwned {
     const JOB_TYPE: &'static str;
 
     /// Enqueue this job to be run at some point in the future.
-    fn enqueue(self, conn: &PgConnection) -> Result<(), EnqueueError> {
+    fn enqueue(self, conn: &mut PgConnection) -> Result<(), EnqueueError> {
         storage::enqueue_job(conn, self)
     }
 
-    /// The logic involved in actually performing this job.
-    fn perform(self, env: &Self::Environment, pool: &dyn DieselPoolObj)
-        -> Result<(), PerformError>;
+    /// The logic involved in performing this job.
+    fn perform(
+        self,
+        env: &Self::Environment,
+        pool: deadpool_diesel::postgres::Pool,
+    ) -> Result<(), PerformError>;
 }

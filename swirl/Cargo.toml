@@ -1,26 +1,29 @@
+cargo-features = ["edition2021"]
+
 [package]
 name = "swirl"
 version = "0.1.0"
-authors = ["Sean Griffin <sean@seantheprogrammer.com>"]
-edition = "2018"
+authors = ["Sean Griffin <sean@seantheprogrammer.com>", "Dmitriy Cherchenko"]
+edition = "2021"
 description = "A simple background processing framework for Diesel and PostgreSQL"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 swirl_proc_macro = { path = "../swirl_proc_macro" }
-diesel = { version = "1.0.0", features = ["postgres", "serde_json"] }
-threadpool = "1.7"
-serde_json = "1.0.0"
-serde = "1.0.0"
-serde_derive = "1.0.90"
+deadpool-diesel = { git = "https://github.com/dchenk/deadpool", rev = "01c0c916f36598d8d046933cf9ab435009018e47", features = ["postgres"] }
+diesel = { git = "https://github.com/diesel-rs/diesel", rev = "6eae69f3e60b45c383927336b48b6ee860a71e00", features = ["postgres", "serde_json"] }
+threadpool = "1.8"
+tokio = { version = "1.11", features = ["macros"] }
+serde_json = "1.0"
+serde = "1.0"
+serde_derive = "1.0"
 inventory = "0.1"
 
 [dev-dependencies]
 dotenv = "0.11"
 lazy_static = "1.0"
+min-id = "0.1"
 num_cpus = "1.0"
 
 [features]
-default = ["r2d2"]
-r2d2 = ["diesel/r2d2"]
 nightly = ["swirl_proc_macro/nightly"]

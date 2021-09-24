@@ -1,21 +1,18 @@
 use diesel::result::Error as DieselError;
 
 use super::channel;
-use crate::db::DieselPool;
 
-pub type EventSender<Pool> = channel::Sender<Event<Pool>>;
+pub type EventSender = channel::Sender<Event>;
 
-pub enum Event<Pool: DieselPool> {
+pub enum Event {
     Working,
     NoJobAvailable,
     ErrorLoadingJob(DieselError),
-    FailedToAcquireConnection(Pool::Error),
+    FailedToAcquireConnection(deadpool_diesel::PoolError),
 }
 
-use std::fmt;
-
-impl<Pool: DieselPool> fmt::Debug for Event<Pool> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl std::fmt::Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Event::Working => f.debug_struct("Working").finish(),
             Event::NoJobAvailable => f.debug_struct("NoJobAvailable").finish(),

@@ -1,5 +1,8 @@
+cargo-features = ["edition2021"]
+
 [workspace]
 members = [
     "swirl",
+    "swirl/example",
     "integration_tests",
 ]

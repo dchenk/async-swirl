@@ -16,12 +16,9 @@ use diagnostic_shim::*;
 #[proc_macro_attribute]
 pub fn background_job(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !attr.is_empty() {
-        return syn::Error::new(
-            Span::call_site(),
-            "swirl::background_job does not take arguments",
-        )
-        .to_compile_error()
-        .into();
+        return syn::Error::new(Span::call_site(), "swirl::background_job does not take arguments")
+            .to_compile_error()
+            .into();
     }
 
     let item = parse_macro_input!(item as ItemFn);
@@ -29,7 +26,5 @@ pub fn background_job(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 fn emit_errors(result: Result<proc_macro2::TokenStream, Diagnostic>) -> TokenStream {
-    result
-        .map(Into::into)
-        .unwrap_or_else(|e| e.to_compile_error().into())
+    result.map(Into::into).unwrap_or_else(|e| e.to_compile_error().into())
 }

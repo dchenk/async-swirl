@@ -49,10 +49,7 @@ fn check_for_failed_jobs_blocks_until_all_queued_jobs_are_finished() -> Fallible
     let (send, recv) = sync_channel(0);
     let handle = thread::spawn(move || {
         let wait = Duration::from_millis(100);
-        assert!(
-            recv.recv_timeout(wait).is_err(),
-            "wait_for_jobs returned before jobs finished"
-        );
+        assert!(recv.recv_timeout(wait).is_err(), "wait_for_jobs returned before jobs finished");
 
         barrier.wait();
 
@@ -115,10 +112,7 @@ fn run_all_pending_jobs_errs_if_jobs_dont_start_in_timeout() -> Fallible<()> {
 
 #[test]
 fn jobs_failing_to_load_doesnt_panic_threads() -> Fallible<()> {
-    let runner = TestGuard::builder(())
-        .thread_count(1)
-        .connection_count(1)
-        .build();
+    let runner = TestGuard::builder(()).thread_count(1).connection_count(1).build();
 
     {
         let conn = runner.connection_pool().get()?;

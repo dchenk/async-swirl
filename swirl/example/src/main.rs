@@ -8,15 +8,25 @@ fn dummy_job() -> Result<(), PerformError> {
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let database_url = dotenv::var("DATABASE_URL")?;
     println!("Enqueuing 100k jobs");
-    let runner = Runner::builder(()).database_url(database_url).build();
-    enqueue_jobs(&*runner.connection_pool().get()?).unwrap();
+
+    let pool_manager =
+        deadpool_diesel::postgres::Manager::new(&database_url, deadpool_diesel::Runtime::Tokio1);
+    let db_pool = deadpool_diesel::postgres::Pool::builder(pool_manager)
+        .max_size(5)
+        .build()
+        .into(Into::into)?;
+
+    let runner = Runner::builder((), db_pool.clone()).build();
+    let mut conn: PgConnection = db_pool.get().await.unwrap().lock().unwrap().deref_mut();
+    enqueue_jobs(&mut conn).unwrap();
     println!("Running jobs");
     let started = Instant::now();
 
-    runner.run_all_pending_jobs()?;
+    runner.run_all_pending_jobs().await?;
     runner.check_for_failed_jobs()?;
 
     let elapsed = started.elapsed();
@@ -25,7 +35,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn enqueue_jobs(conn: &PgConnection) -> Result<(), EnqueueError> {
+fn enqueue_jobs(conn: &mut PgConnection) -> Result<(), EnqueueError> {
     use diesel::sql_query;
     sql_query("TRUNCATE TABLE background_jobs;").execute(conn)?;
     for _ in 0..100_000 {
