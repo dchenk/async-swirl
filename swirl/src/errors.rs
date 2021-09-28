@@ -47,38 +47,38 @@ impl Error for EnqueueError {
     }
 }
 
-/// An error occurred performing the job
-pub type PerformError = Box<dyn Error>;
+/// An error that occurred performing a job.
+// pub type PerformError = Box<dyn Error>;
+// pub type PerformError = Box<dyn Error + Send>;
+pub type PerformError = String;
 
 /// An error occurred while attempting to fetch jobs from the queue
-pub enum FetchError {
-    /// We could not acquire a database connection from the pool.
-    ///
-    /// Either the connection pool is too small, or new connections cannot be
-    /// established.
-    NoDatabaseConnection(deadpool_diesel::PoolError),
+// pub enum RunningError {
+//     /// We could not acquire a database connection from the pool.
+//     ///
+//     /// Either the connection pool is too small, or new connections cannot be
+//     /// established.
+//     NoDatabaseConnection(deadpool_diesel::PoolError),
+//
+//     /// Could not execute the query to load a job from the database.
+//     FailedLoadingJob(DieselError),
+//
+//     JobPanicked(PerformError),
+// }
+//
+// impl fmt::Debug for FetchError {
+//     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+//         match self {
+//             FetchError::NoDatabaseConnection(e) => {
+//                 f.debug_tuple("NoDatabaseConnection").field(e).finish()
+//             }
+//             FetchError::FailedLoadingJob(e) => f.debug_tuple("FailedLoadingJob").field(e).finish(),
+//             FetchError::NoMessageReceived => f.debug_struct("NoMessageReceived").finish(),
+//         }
+//     }
+// }
 
-    /// Could not execute the query to load a job from the database.
-    FailedLoadingJob(DieselError),
-
-    /// No message was received from the worker thread.
-    ///
-    /// Either the thread pool is too small, or jobs have hung indefinitely
-    NoMessageReceived,
-}
-
-impl fmt::Debug for FetchError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            FetchError::NoDatabaseConnection(e) => {
-                f.debug_tuple("NoDatabaseConnection").field(e).finish()
-            }
-            FetchError::FailedLoadingJob(e) => f.debug_tuple("FailedLoadingJob").field(e).finish(),
-            FetchError::NoMessageReceived => f.debug_struct("NoMessageReceived").finish(),
-        }
-    }
-}
-
+/*
 impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
@@ -109,7 +109,7 @@ impl Error for FetchError {
         }
     }
 }
-
+*/
 /// An error returned by `Runner::check_for_failed_jobs`. Only used in tests.
 #[derive(Debug)]
 pub enum FailedJobsError {

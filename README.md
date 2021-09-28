@@ -104,9 +104,6 @@ that all jobs are idempotent.
 
 Planned features that are not yet implemented are:
 
-- Allowing jobs to take a database connection as an argument
-  - If your jobs need a DB connection today, put the connection pool on your
-    environment.
 - More robust and configurable logging
 - Configurable retry behavior
 - Less boilerplate in the job runner

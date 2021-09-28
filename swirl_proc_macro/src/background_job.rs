@@ -88,11 +88,11 @@ impl BackgroundJob {
                 .error("#[swirl::background_job] cannot be used on unsafe functions"));
         }
 
-        if let Some(asyncness) = sig.asyncness {
-            return Err(asyncness
-                .span
-                .error("#[swirl::background_job] cannot be used on async functions"));
-        }
+        // if let Some(asyncness) = sig.asyncness {
+        //     return Err(asyncness
+        //         .span
+        //         .error("#[swirl::background_job] cannot be used on async functions"));
+        // }
 
         if let Some(abi) = sig.abi {
             return Err(abi
@@ -172,16 +172,13 @@ impl JobArgs {
             match (&env_arg, &connection_arg, Arg::try_from(pat_type)?) {
                 (None, _, Arg::Env(arg)) => env_arg = Some(arg),
                 (Some(_), _, Arg::Env(_)) => {
-                    return Err(
-                        span.error("Background jobs cannot take references as arguments")
-                            .help("If this argument is a database connection, the type must be `&mut PgConnection`")
-                    );
+                    return Err(span.error("Background jobs cannot take references as arguments"));
                 }
                 (_, ConnectionArg::None, Arg::Connection(arg)) => connection_arg = arg,
                 (_, _, Arg::Connection(_)) => {
                     return Err(
                         span.error("Multiple database connection arguments")
-                            .help("To take a connection pool as an argument instead of a single connection, use the type `deadpool_diesel::postgres::Pool`")
+                            .help("To take a connection pool as an argument, use the type `swirl::DieselPool` as the second argument")
                     );
                 }
                 (_, _, Arg::Normal(pat_type)) => args.push(pat_type),
@@ -261,24 +258,16 @@ impl Default for EnvArg {
 
 enum ConnectionArg {
     None,
-    SingleConnection(Box<syn::Pat>),
+    // SingleConnection(Box<syn::Pat>),
     Pool(Box<syn::Pat>, Box<syn::Type>),
 }
 
 impl ConnectionArg {
-    fn is_single_connection(ty: &syn::Type) -> bool {
-        if let syn::Type::Path(syn::TypePath { path, .. }) = ty {
-            path_ends_with(path, "PgConnection")
-        } else {
-            false
-        }
-    }
-
     fn is_pool(ty: &syn::Type) -> bool {
         if let syn::Type::TraitObject(type_trait_object) = ty {
             type_trait_object.bounds.iter().any(|bound| {
                 if let syn::TypeParamBound::Trait(trait_bound) = bound {
-                    path_ends_with(&trait_bound.path, "DieselPoolObj")
+                    path_ends_with(&trait_bound.path, "DieselPool")
                 } else {
                     false
                 }
@@ -289,13 +278,14 @@ impl ConnectionArg {
     }
 
     fn is_connection_arg(ty: &syn::Type) -> bool {
-        Self::is_single_connection(ty) || Self::is_pool(ty)
+        Self::is_pool(ty)
     }
 
     fn from_arg(pat: Box<syn::Pat>, ty: Box<syn::Type>) -> Self {
-        if Self::is_single_connection(&ty) {
-            ConnectionArg::SingleConnection(pat)
-        } else if Self::is_pool(&ty) {
+        // if Self::is_single_connection(&ty) {
+        //     ConnectionArg::SingleConnection(pat)
+        // } else
+        if Self::is_pool(&ty) {
             ConnectionArg::Pool(pat, ty)
         } else {
             ConnectionArg::None
@@ -304,33 +294,32 @@ impl ConnectionArg {
 
     fn pool_pat(&self) -> Cow<'_, syn::Pat> {
         match self {
+            // ConnectionArg::None => Cow::Owned(syn::parse_quote!(_)),
             ConnectionArg::None => Cow::Owned(syn::parse_quote!(_)),
-            ConnectionArg::SingleConnection(_) => {
-                Cow::Owned(syn::parse_quote!(__swirl_connection_pool))
-            }
-            ConnectionArg::Pool(pat, _) => Cow::Borrowed(pat),
+            // ConnectionArg::SingleConnection(_) => {
+            //     Cow::Owned(syn::parse_quote!(__swirl_connection_pool))
+            // }
+            // ConnectionArg::Pool(pat, _) => Cow::Borrowed(pat),
+            // ConnectionArg::Pool(pat, _) => Cow::Owned(syn::parse_quote!(__swirl_connection_pool)),
+            ConnectionArg::Pool(pat, _) => Cow::Owned(syn::parse_quote!(#pat)),
         }
     }
 
     fn pool_ty(&self) -> Cow<'_, syn::Type> {
         if let ConnectionArg::Pool(_, ty) = self {
-            Cow::Borrowed(ty)
+            println!("A {:?}", ty);
+            // Cow::Borrowed(ty)
+            Cow::Owned(syn::parse_quote!(swirl::DieselPool))
+            // Cow::Owned(syn::parse_quote!(#ty))
         } else {
-            Cow::Owned(syn::parse_quote!(swirl::db::DieselPoolObj))
+            println!("B");
+            Cow::Owned(syn::parse_quote!(swirl::DieselPool))
         }
     }
 
+    // TODO: async/await
     fn wrap(&self, body: Vec<syn::Stmt>) -> TokenStream {
-        let mut body = quote!(#(#body)*);
-        if let ConnectionArg::SingleConnection(pat) = self {
-            let pool_pat = self.pool_pat();
-            body = quote! {
-                #pool_pat.with_connection(&|#pat| {
-                    #body
-                })
-            }
-        }
-        body
+        quote!(#(#body)*)
     }
 }
 

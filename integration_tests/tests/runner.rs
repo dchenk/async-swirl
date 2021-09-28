@@ -94,7 +94,7 @@ fn run_all_pending_jobs_errs_if_jobs_dont_start_in_timeout() -> Fallible<()> {
     // The second job will never start.
     let runner = TestGuard::builder(barrier.clone())
         .thread_count(1)
-        .job_start_timeout(Duration::from_millis(50))
+        .job_timeout(Duration::from_millis(50))
         .build();
     let conn = runner.connection_pool().get()?;
     barrier_job().enqueue(&conn)?;

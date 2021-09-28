@@ -58,12 +58,12 @@ pub fn find_next_unlocked_job(conn: &mut PgConnection) -> QueryResult<Background
         .first::<BackgroundJob>(conn)
 }
 
-/// The number of jobs that have failed at least once
-pub fn failed_job_count(conn: &mut PgConnection) -> QueryResult<i64> {
-    use crate::schema::background_jobs::dsl::*;
-
-    background_jobs.count().filter(retries.gt(0)).get_result(conn)
-}
+// /// The number of jobs that have failed at least once
+// pub fn failed_job_count(conn: &mut PgConnection) -> QueryResult<i64> {
+//     use crate::schema::background_jobs::dsl::*;
+//
+//     background_jobs.count().filter(retries.gt(0)).get_result(conn)
+// }
 
 /// Deletes a job that has successfully completed running
 pub fn delete_successful_job(conn: &mut PgConnection, job_id: &String) -> QueryResult<()> {

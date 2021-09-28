@@ -87,7 +87,7 @@ fn perform_job<T: Job>(
          Please open an issue at https://github.com/dchenk/swirl/issues/new"
             .into()
     })?;
-    let data = serde_json::from_value(data)?;
+    let data = serde_json::from_value(data).map_err(|e| format!("{:?}", e))?;
     T::perform(data, environment, pool)
 }
 

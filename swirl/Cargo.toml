@@ -12,6 +12,7 @@ license = "MIT OR Apache-2.0"
 swirl_proc_macro = { path = "../swirl_proc_macro" }
 deadpool-diesel = { git = "https://github.com/dchenk/deadpool", rev = "01c0c916f36598d8d046933cf9ab435009018e47", features = ["postgres"] }
 diesel = { git = "https://github.com/diesel-rs/diesel", rev = "6eae69f3e60b45c383927336b48b6ee860a71e00", features = ["postgres", "serde_json"] }
+futures = "0.3"
 threadpool = "1.8"
 tokio = { version = "1.11", features = ["macros"] }
 serde_json = "1.0"

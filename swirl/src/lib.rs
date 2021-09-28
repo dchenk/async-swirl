@@ -13,7 +13,6 @@ mod registry;
 mod runner;
 mod storage;
 
-pub mod db;
 pub mod errors;
 pub mod schema;
 
@@ -29,3 +28,5 @@ pub use runner::*;
 
 #[doc(hidden)]
 pub use registry::JobVTable;
+
+pub type DieselPool = deadpool_diesel::postgres::Pool;
