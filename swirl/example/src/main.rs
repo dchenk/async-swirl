@@ -1,6 +1,5 @@
 use diesel::prelude::*;
 use std::error::Error;
-use std::ops::DerefMut;
 use std::time::Instant;
 use swirl::*;
 
@@ -20,12 +19,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let db_pool = deadpool_diesel::postgres::Pool::builder(pool_manager).max_size(5).build()?;
 
     let runner = Runner::builder((), db_pool.clone()).build();
-    let mut conn: &mut PgConnection = db_pool.get().await.unwrap().lock().unwrap().deref_mut();
-    enqueue_jobs(&mut conn).unwrap();
+    let conn_wrapper = db_pool.get().await.unwrap();
+    let mut conn = conn_wrapper.lock().unwrap();
+    enqueue_jobs(&mut *conn).unwrap();
+
     println!("Running jobs");
     let started = Instant::now();
 
-    runner.run_all_pending_jobs().await?;
+    runner.start().await?;
 
     let elapsed = started.elapsed();
     println!("Ran 100k jobs in {} seconds", elapsed.as_secs());

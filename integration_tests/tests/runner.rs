@@ -12,14 +12,14 @@ use crate::sync::Barrier;
 use crate::test_guard::TestGuard;
 
 #[test]
-fn run_all_pending_jobs_returns_when_all_jobs_enqueued() -> Fallible<()> {
+fn start_returns_when_all_jobs_enqueued() -> Fallible<()> {
     let barrier = Barrier::new(3);
     let runner = TestGuard::runner(barrier.clone());
     let conn = runner.connection_pool().get()?;
     barrier_job().enqueue(&conn)?;
     barrier_job().enqueue(&conn)?;
 
-    runner.run_all_pending_jobs()?;
+    runner.start()?;
 
     let queued_job_count = background_jobs::table.count().get_result(&conn);
     let unlocked_job_count = background_jobs::table
@@ -44,7 +44,7 @@ fn check_for_failed_jobs_blocks_until_all_queued_jobs_are_finished() -> Fallible
     barrier_job().enqueue(&conn)?;
     barrier_job().enqueue(&conn)?;
 
-    runner.run_all_pending_jobs()?;
+    runner.start()?;
 
     let (send, recv) = sync_channel(0);
     let handle = thread::spawn(move || {
@@ -70,7 +70,7 @@ fn check_for_failed_jobs_panics_if_jobs_failed() -> Fallible<()> {
     failure_job().enqueue(&conn)?;
     failure_job().enqueue(&conn)?;
 
-    runner.run_all_pending_jobs()?;
+    runner.start()?;
     assert_eq!(Err(JobsFailed(3)), runner.check_for_failed_jobs());
     Ok(())
 }
@@ -82,13 +82,13 @@ fn panicking_jobs_are_caught_and_treated_as_failures() -> Fallible<()> {
     panic_job().enqueue(&conn)?;
     failure_job().enqueue(&conn)?;
 
-    runner.run_all_pending_jobs()?;
+    runner.start()?;
     assert_eq!(Err(JobsFailed(2)), runner.check_for_failed_jobs());
     Ok(())
 }
 
 #[test]
-fn run_all_pending_jobs_errs_if_jobs_dont_start_in_timeout() -> Fallible<()> {
+fn start_errs_if_jobs_dont_start_in_timeout() -> Fallible<()> {
     let barrier = Barrier::new(2);
     // A runner with 1 thread where all jobs will hang indefinitely.
     // The second job will never start.
@@ -100,7 +100,7 @@ fn run_all_pending_jobs_errs_if_jobs_dont_start_in_timeout() -> Fallible<()> {
     barrier_job().enqueue(&conn)?;
     barrier_job().enqueue(&conn)?;
 
-    let run_result = runner.run_all_pending_jobs();
+    let run_result = runner.start();
     assert_matches!(run_result, Err(swirl::FetchError::NoMessageReceived));
 
     // Make sure the jobs actually run so we don't panic on drop
@@ -122,7 +122,7 @@ fn jobs_failing_to_load_doesnt_panic_threads() -> Fallible<()> {
         diesel::sql_query("SET default_transaction_read_only = 't'").execute(&conn)?;
     }
 
-    let run_result = runner.run_all_pending_jobs();
+    let run_result = runner.start();
 
     {
         let conn = runner.connection_pool().get()?;

@@ -8,7 +8,7 @@ use futures::stream::FuturesUnordered;
 use event::*;
 
 use crate::errors::*;
-use crate::{storage, Registry};
+use crate::{storage, DieselPool, Registry};
 
 mod event;
 
@@ -98,72 +98,48 @@ impl<Env> Runner<Env>
 where
     Env: RefUnwindSafe + Send + Sync + 'static,
 {
-    /// Runs all pending jobs in the queue.
-    ///
-    /// This function will return once all jobs in the queue have begun running but
-    /// does not wait for them to complete. When this function returns, at least one
-    /// thread will have tried to acquire a new job and found there were none in
-    /// the queue.
-    ///
-    /// New: Stop queueing more jobs as soon as an error occurs.
-    ///
-    /// Trade-off: Give up some potential for saturating worker threads so that we
-    /// can handle every error.
-    // pub async fn run_all_pending_jobs(&self) -> Result<(), FetchError> {
-    pub async fn run_all_pending_jobs(&'static self) -> Result<(), Event> {
+    /// Runs all pending jobs in the queue and continue to pick up and run jobs until an
+    /// error processing jobs occurs or until a job panics. This function does not stop
+    /// when a normal error occurs within the execution of a job.
+    // TODO: Add a sleep when a job worker finds no queued jobs.
+    pub async fn start(&self) -> Result<(), Event> {
         use futures::StreamExt;
 
-        let max_threads = self.concurrency;
-        // let worker_semaphore = Semaphore::new(max_threads);
+        let job_timeout = self.job_timeout.clone();
 
-        // let (sender, receiver) = channel::new(max_threads);
-        // let mut pending_messages = 0;
-
-        // let (err_sender, err_receiver) = channel::new(max_threads);
-
-        // let mut fut = futures::future::ready::<usize>(1);
-        let mut async_tasks = FuturesUnordered::new();
-
-        // let mut err: std::sync::Arc<std::sync::Mutex<Option<()>>> =
-        //     std::sync::Arc::new(std::sync::Mutex::new(None));
-
-        // let has_error = std::sync::Arc::new(AtomicBool::new(false));
-        // let has_error1 = has_error.clone();
-        // let has_error2 = has_error.clone();
-
-        let do_job = || {
-            tokio::task::spawn_blocking(|| {
+        let do_job = move |connection_pool: DieselPool,
+                           environment: Arc<Env>,
+                           registry: Arc<Registry<Env>>| {
+            tokio::task::spawn_blocking(move || {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .unwrap()
                     .block_on(tokio::time::timeout(
-                        self.job_timeout.clone(), // TODO: configurable
-                        self.run_single_job(),
+                        job_timeout.clone(),
+                        Self::run_single_job(connection_pool, environment, registry),
                     ))
             })
         };
 
+        let max_threads = self.concurrency;
+
+        let mut async_tasks = FuturesUnordered::new();
+
         let mut err: Option<Event> = None;
 
-        // let t1 = tokio::spawn(async move {
-        //     let t1 = tokio::spawn(async move {
         loop {
-            // let has_err = ec1.load(Ordering::SeqCst);
             let running_tasks = async_tasks.len();
 
             tokio::select! {
                 biased;
 
-                // _ = async {}, if has_err && running_tasks == 0 => {
                 _ = async {}, if err.is_some() && running_tasks == 0 => {
                     println!("Shutting down");
                     return Err(err.unwrap());
-                    // break;
                 }
-                // _ = async {}, if !has_err && running_tasks < max_threads => {
                 _ = async {}, if err.is_none() && running_tasks < max_threads => {
-                    async_tasks.push(do_job());
+                    async_tasks.push(do_job(self.connection_pool.clone(), self.environment.clone(), self.registry.clone()));
                 }
                 job_run_res = async_tasks.select_next_some() => {
                     // Don't start any more job executions if an error has occurred.
@@ -176,7 +152,9 @@ where
                                 Ok(job_res) => {
                                     match job_res {
                                         Ok(_) => {
-                                            async_tasks.push(do_job());
+                                            if err.is_none() {
+                                                async_tasks.push(do_job(self.connection_pool.clone(), self.environment.clone(), self.registry.clone()));
+                                            }
                                         },
                                         Err(e) => {
                                             err = Some(e);
@@ -184,9 +162,9 @@ where
                                     }
                                 }
                                 Err(e) => {
-                                    // The job timed out.
+                                    // The job timed out. Keep taking on more jobs.
                                     eprintln!("Job timed out: {}", e);
-                                    async_tasks.push(do_job());
+                                    async_tasks.push(do_job(self.connection_pool.clone(), self.environment.clone(), self.registry.clone()));
                                 }
                             }
                         }
@@ -196,66 +174,40 @@ where
         }
 
         // TODO: Catch CTRL+C and return Ok(())
-        // });
-
-        // let t2 = tokio::spawn(async move {
-        // match receiver.recv_timeout(self.job_timeout) {
-        //     Ok(Event::Working) => pending_messages -= 1,
-        //     Ok(Event::NoJobAvailable) => return Ok(()),
-        //     Ok(Event::ErrorLoadingJob(e)) => return Err(FetchError::FailedLoadingJob(e)),
-        //     Ok(Event::FailedToAcquireConnection(e)) => {
-        //         return Err(FetchError::NoDatabaseConnection(e));
-        //     }
-        //     Ok(Event::TaskExecutionFailed(e)) => {
-        //         return Err(FetchError::TaskExecutionFailed(e));
-        //     }
-        //     Err(_) => return Err(FetchError::NoMessageReceived),
-        // }
-        //
-        // Ok(())
-        // });
-
-        // tokio::join!(t1, t2)
-        //     .map_err(|e| {
-        //         println!("ERR: {:?}", e);
-        //
-        //         FetchError::TaskExecutionFailed(e);
-        //     })
-        //     .await
     }
 
-    // async fn run_single_job(&self, sender: EventSender) {
-    async fn run_single_job(&self) -> Result<(), Event> {
-        let environment = Arc::clone(&self.environment);
-        let registry = Arc::clone(&self.registry);
-        // let connection_pool = AssertUnwindSafe(self.connection_pool().clone());
-        // let connection_pool = &self.connection_pool;
-        let connection_pool: AssertUnwindSafe<deadpool_diesel::postgres::Pool> =
-            AssertUnwindSafe(self.connection_pool.clone()); // TODO: document why
+    async fn run_single_job(
+        connection_pool: DieselPool,
+        environment: Arc<Env>,
+        registry: Arc<Registry<Env>>,
+    ) -> Result<(), Event> {
+        // We don't technically have a guarantee that the Pool ends up in an internally consistent
+        // state after the function that it's passed to panics (i.e., that it is UnwindSafe). Even
+        // if it is already safe, we err on the side of caution and deliberately stop processing new
+        // jobs whenever a panic occurs.
+        let conn_pool: AssertUnwindSafe<deadpool_diesel::postgres::Pool> =
+            AssertUnwindSafe(connection_pool.clone());
 
-        self.get_single_job(move |job| {
-            let perform_job = registry
-                .get(&job.job_type)
-                // .ok_or_else(|| PerformError::from(format!("Unknown job type {}", job.job_type)))?;
-                .ok_or_else(|| format!("Unknown job type {}", job.job_type))?;
-            perform_job.perform(job.data, &environment, connection_pool.clone())
-        })
+        Self::get_single_job(
+            move |job| {
+                let perform_job = registry
+                    .get(&job.job_type)
+                    .ok_or_else(|| format!("Unknown job type {}", job.job_type))?;
+                perform_job.perform(job.data, &environment, conn_pool.clone())
+            },
+            connection_pool.clone(),
+        )
         .await
     }
 
-    // async fn get_single_job<F>(&self, sender: EventSender, f: F)
-    async fn get_single_job<F>(&self, f: F) -> Result<(), Event>
+    // TODO: Refactor this into run_single_job
+    async fn get_single_job<F>(f: F, connection_pool: DieselPool) -> Result<(), Event>
     where
         F: FnOnce(storage::BackgroundJob) -> Result<(), PerformError> + Send + UnwindSafe + 'static,
     {
-        let conn_pool: deadpool_diesel::postgres::Pool = self.connection_pool.clone();
-
-        // self.thread_pool.execute(move || {
-        // let res = tokio::task::spawn_blocking(move || async move {
-        let conn_wrapper = match conn_pool.get().await {
+        let conn_wrapper = match connection_pool.get().await {
             Ok(cw) => cw,
             Err(e) => {
-                // sender.send(Event::FailedToAcquireConnection(e));
                 return Err(Event::FailedToAcquireConnection(e));
             }
         };
@@ -263,41 +215,17 @@ where
         let mut conn = match conn_wrapper.lock() {
             Ok(conn) => conn,
             Err(_e) => {
-                // sender
-                //     .send(Event::FailedToAcquireConnection(deadpool_diesel::PoolError::Closed));
-                // return;
                 return Err(Event::FailedToAcquireConnection(deadpool_diesel::PoolError::Closed));
             }
         };
 
-        // #[derive(Debug)]
-        // pub enum TxnError {
-        //     // TxnInternal is created when there's an error processing the transaction.
-        //     TxnInternal(diesel::result::Error),
-        //     // Perform is created when there's an error within the task.
-        //     Perform(PerformError),
-        // }
-
-        // impl From<diesel::result::Error> for TxnError {
-        //     fn from(err: diesel::result::Error) -> Self {
-        //         TxnError::TxnInternal(err)
-        //     }
-        // }
-
-        // let job_run_result = conn.transaction::<(), Event, _>(|conn| {
         conn.transaction::<(), Event, _>(|conn| {
             let job = match storage::find_next_unlocked_job(conn).optional() {
-                Ok(Some(j)) => {
-                    // sender.send(Event::Working);
-                    j
-                }
+                Ok(Some(j)) => j,
                 Ok(None) => {
-                    // sender.send(Event::NoJobAvailable);
                     return Ok(());
                 }
                 Err(e) => {
-                    // sender.send(Event::ErrorLoadingJob(e));
-                    // return Err(RollbackTransaction);
                     return Err(Event::ErrorLoadingJob(e));
                 }
             };
@@ -330,37 +258,7 @@ where
                     }
                 }
             }
-
-            // let result = catch_unwind(|| f(job))
-            //     .map_err(|e| try_to_extract_panic_info(&e))
-            // let result = r1
-            //     .and_then(|r| r);
-            //
-            // match result {
-            //     Ok(_) => storage::delete_successful_job(conn, &job_id),
-            //     Err(e) => {
-            //         eprintln!("Job {} failed: {}", job_id, e);
-            //         storage::update_failed_job(conn, &job_id);
-            //         Err(e)
-            //     }
-            // }
         })
-
-        // match job_run_result {
-        //     Ok(_) | Err(Event::TaskFailed(_)) => Ok(()),
-        //     // Ok(_) | Err(RollbackTransaction) => Ok(()),
-        //     Err(e) => {
-        //         Err(e)
-        //         // panic!("Failed to update job: {:?}", e);
-        //     }
-        // }
-        // })
-        // .await;
-        //
-        // if let Err(e) = res {
-        //     sender.send(Event::TaskExecutionFailed(e));
-        //     return;
-        // }
     }
 }
 
@@ -385,7 +283,7 @@ fn try_to_extract_panic_info(info: &(dyn std::any::Any + Send + 'static)) -> Per
 #[cfg(test)]
 mod tests {
     use std::panic::AssertUnwindSafe;
-    use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+    use std::sync::{Barrier, Mutex, MutexGuard};
 
     use diesel::prelude::*;
 

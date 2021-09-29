@@ -20,7 +20,7 @@ fn generated_jobs_serialize_all_arguments_except_first() -> Fallible<()> {
     check_arg_equal_to_env("a".into()).enqueue(&conn)?;
     check_arg_equal_to_env("b".into()).enqueue(&conn)?;
 
-    runner.run_all_pending_jobs()?;
+    runner.start()?;
     assert_eq!(Err(JobsFailed(1)), runner.check_for_failed_jobs());
     Ok(())
 }
@@ -41,7 +41,7 @@ fn jobs_with_args_but_no_env() -> Fallible<()> {
     assert_foo("foo".into()).enqueue(&conn)?;
     assert_foo("not foo".into()).enqueue(&conn)?;
 
-    runner.run_all_pending_jobs()?;
+    runner.start()?;
     assert_eq!(Err(JobsFailed(1)), runner.check_for_failed_jobs());
     Ok(())
 }
@@ -58,7 +58,7 @@ fn env_can_have_any_name() -> Fallible<()> {
     let conn = runner.connection_pool().get()?;
     env_with_different_name().enqueue(&conn)?;
 
-    runner.run_all_pending_jobs()?;
+    runner.start()?;
     runner.check_for_failed_jobs()?;
     Ok(())
 }
@@ -81,7 +81,7 @@ fn test_imports_only_used_in_job_body_are_not_warned_as_unused() -> Fallible<()>
     let conn = runner.connection_pool().get()?;
     uses_trait_import().enqueue(&conn)?;
 
-    runner.run_all_pending_jobs()?;
+    runner.start()?;
     runner.check_for_failed_jobs()?;
     Ok(())
 }
@@ -141,7 +141,7 @@ fn jobs_can_take_a_connection_as_an_argument() -> Fallible<()> {
         takes_fully_qualified_pool().enqueue(&conn)?;
     }
 
-    runner.run_all_pending_jobs()?;
+    runner.start()?;
     runner.check_for_failed_jobs()?;
     Ok(())
 }

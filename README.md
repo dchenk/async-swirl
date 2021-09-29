@@ -69,26 +69,11 @@ well configured for your runner. Your connection pool size should be at least as
 big as the thread pool size (defaults to the number of CPUs on your machine), or
 double that if your jobs require a database connection.
 
-Once the runner is created, calling `run_all_pending_jobs` will continuously
-saturate all available threads, attempting to run one job per thread at a time.
-It will return `Ok(())` once at least one thread has reported there were no jobs
-available to run, or an error if a job fails to start running. Note that this
-function does not know or care if a job *completes* successfully, only if we
-were successful at starting to do work. Typically this function should be called
-in a loop:
-
-```rust
-loop {
-    if let Err(e) = runner.run_all_pending_jobs() {
-        // Something has gone seriously wrong. The database might be down,
-        // or the thread pool may have died. We could just try again, or
-        // perhaps rebuild the runner, or crash/restart the process.
-    }
-}
-```
-
-In situations where you have low job throughput, you can add a sleep to this
-loop to wait some period of time before looking for more jobs.
+Once the runner is created, calling `start` will continuously saturate the number
+of specified worker threads, running one job per thread at a time. The function
+never returns (TODO: catch a CTRL+C signal) Ok but returns an Err if an error
+processing jobs occurs or until a job panics. This function does not stop when a
+normal error occurs within the execution of a job.
 
 When a job fails (by returning an error or panicking), it will be retried after
 `1 ^ {retry_count}` minutes. If a job fails or an error occurs marking a job as

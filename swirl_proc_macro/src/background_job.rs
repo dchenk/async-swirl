@@ -16,7 +16,6 @@ pub fn expand(item: syn::ItemFn) -> Result<TokenStream, Diagnostic> {
     let env_type = &job.args.env_arg.ty;
     let connection_arg = &job.args.connection_arg;
     let pool_pat = connection_arg.pool_pat();
-    let pool_ty = connection_arg.pool_ty();
     let fn_args = job.args.iter();
     let struct_def = job.args.struct_def();
     let struct_assign = job.args.struct_assign();
@@ -36,7 +35,7 @@ pub fn expand(item: syn::ItemFn) -> Result<TokenStream, Diagnostic> {
             type Environment = #env_type;
             const JOB_TYPE: &'static str = stringify!(#name);
 
-            #fn_token perform(self, #env_pat: &Self::Environment, #pool_pat: &#pool_ty) #return_type {
+            #fn_token perform(self, #env_pat: &Self::Environment, #pool_pat: swirl::DieselPool) #return_type {
                 let Self { #(#arg_names),* } = self;
                 #body
             }
@@ -302,18 +301,6 @@ impl ConnectionArg {
             // ConnectionArg::Pool(pat, _) => Cow::Borrowed(pat),
             // ConnectionArg::Pool(pat, _) => Cow::Owned(syn::parse_quote!(__swirl_connection_pool)),
             ConnectionArg::Pool(pat, _) => Cow::Owned(syn::parse_quote!(#pat)),
-        }
-    }
-
-    fn pool_ty(&self) -> Cow<'_, syn::Type> {
-        if let ConnectionArg::Pool(_, ty) = self {
-            println!("A {:?}", ty);
-            // Cow::Borrowed(ty)
-            Cow::Owned(syn::parse_quote!(swirl::DieselPool))
-            // Cow::Owned(syn::parse_quote!(#ty))
-        } else {
-            println!("B");
-            Cow::Owned(syn::parse_quote!(swirl::DieselPool))
         }
     }
 
