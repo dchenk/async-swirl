@@ -1,16 +1,12 @@
-use std::panic::{catch_unwind, AssertUnwindSafe, PanicInfo, RefUnwindSafe, UnwindSafe};
+use std::panic::{catch_unwind, AssertUnwindSafe, PanicInfo, RefUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
 use diesel::prelude::*;
 use futures::stream::FuturesUnordered;
 
-use event::*;
-
 use crate::errors::*;
 use crate::{storage, DieselPool, Registry};
-
-mod event;
 
 pub struct NoConnectionPoolGiven;
 
@@ -34,20 +30,10 @@ impl<Env> Builder<Env> {
     /// The amount of time to wait for a job to run before assuming an error
     /// has occurred.
     ///
-    /// Defaults to 10 seconds.
+    /// Defaults to 300 seconds (5 minutes).
     pub fn job_timeout(mut self, timeout: Duration) -> Self {
         self.job_timeout = Some(timeout);
         self
-    }
-
-    /// Provide a connection pool to be used by the runner.
-    pub fn connection_pool(self, pool: deadpool_diesel::postgres::Pool) -> Builder<Env> {
-        Builder {
-            connection_pool: pool,
-            environment: self.environment,
-            concurrency: self.concurrency,
-            job_timeout: self.job_timeout,
-        }
     }
 }
 
@@ -75,12 +61,10 @@ pub struct Runner<Env: 'static> {
 }
 
 impl<Env> Runner<Env> {
-    /// Create a builder for a job runner
+    /// Create a builder for a Runner.
     ///
-    /// This method takes the two required configurations: the database
-    /// connection pool, and the environment to pass to your jobs. If your
-    /// environment contains a connection pool, it should be the same pool given
-    /// here.
+    /// This method takes the two required configurations: the database connection pool
+    /// and the environment to pass to jobs.
     pub fn builder(
         environment: Env,
         connection_pool: deadpool_diesel::postgres::Pool,
@@ -101,8 +85,7 @@ where
     /// Runs all pending jobs in the queue and continue to pick up and run jobs until an
     /// error processing jobs occurs or until a job panics. This function does not stop
     /// when a normal error occurs within the execution of a job.
-    // TODO: Add a sleep when a job worker finds no queued jobs.
-    pub async fn start(&self) -> Result<(), Event> {
+    pub async fn start(&self) -> Result<(), JobRunnerError> {
         use futures::StreamExt;
 
         let job_timeout = self.job_timeout.clone();
@@ -126,7 +109,7 @@ where
 
         let mut async_tasks = FuturesUnordered::new();
 
-        let mut err: Option<Event> = None;
+        let mut err: Option<JobRunnerError> = None;
 
         loop {
             let running_tasks = async_tasks.len();
@@ -145,7 +128,7 @@ where
                     // Don't start any more job executions if an error has occurred.
                     match job_run_res {
                         Err(join_err) => {
-                            err = Some(Event::TaskExecutionFailed(join_err));
+                            err = Some(JobRunnerError::TaskExecutionFailed(join_err));
                         }
                         Ok(job_timeout_res) => {
                             match job_timeout_res {
@@ -180,72 +163,64 @@ where
         connection_pool: DieselPool,
         environment: Arc<Env>,
         registry: Arc<Registry<Env>>,
-    ) -> Result<(), Event> {
-        // We don't technically have a guarantee that the Pool ends up in an internally consistent
-        // state after the function that it's passed to panics (i.e., that it is UnwindSafe). Even
-        // if it is already safe, we err on the side of caution and deliberately stop processing new
-        // jobs whenever a panic occurs.
-        let conn_pool: AssertUnwindSafe<deadpool_diesel::postgres::Pool> =
-            AssertUnwindSafe(connection_pool.clone());
-
-        Self::get_single_job(
-            move |job| {
-                let perform_job = registry
-                    .get(&job.job_type)
-                    .ok_or_else(|| format!("Unknown job type {}", job.job_type))?;
-                perform_job.perform(job.data, &environment, conn_pool.clone())
-            },
-            connection_pool.clone(),
-        )
-        .await
-    }
-
-    // TODO: Refactor this into run_single_job
-    async fn get_single_job<F>(f: F, connection_pool: DieselPool) -> Result<(), Event>
-    where
-        F: FnOnce(storage::BackgroundJob) -> Result<(), PerformError> + Send + UnwindSafe + 'static,
-    {
+    ) -> Result<(), JobRunnerError> {
         let conn_wrapper = match connection_pool.get().await {
             Ok(cw) => cw,
             Err(e) => {
-                return Err(Event::FailedToAcquireConnection(e));
+                return Err(JobRunnerError::FailedToAcquireConnection(e));
             }
         };
 
         let mut conn = match conn_wrapper.lock() {
             Ok(conn) => conn,
             Err(_e) => {
-                return Err(Event::FailedToAcquireConnection(deadpool_diesel::PoolError::Closed));
+                return Err(JobRunnerError::FailedToAcquireConnection(
+                    deadpool_diesel::PoolError::Closed,
+                ));
             }
         };
 
-        conn.transaction::<(), Event, _>(|conn| {
+        conn.transaction::<(), JobRunnerError, _>(|conn| {
             let job = match storage::find_next_unlocked_job(conn).optional() {
                 Ok(Some(j)) => j,
                 Ok(None) => {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
                     return Ok(());
                 }
                 Err(e) => {
-                    return Err(Event::ErrorLoadingJob(e));
+                    return Err(JobRunnerError::ErrorLoadingJob(e));
                 }
             };
 
             let job_id = job.id.clone();
 
-            let r1 = catch_unwind(|| f(job)).map_err(|e| try_to_extract_panic_info(&e));
-            match r1 {
+            let perform_job = registry.get(&job.job_type).ok_or_else(|| {
+                JobRunnerError::UnrecognizedJob(format!(
+                    "Unknown job type {} for job {}",
+                    job.job_type, job_id
+                ))
+            })?;
+
+            // We don't have a guarantee that the Pool ends up in an internally consistent state
+            // after the function that it's passed to panics (i.e., that it is UnwindSafe). Even if
+            // it is already safe, we err on the side of caution and deliberately stop processing
+            // new jobs whenever a panic occurs.
+            let conn_pool: AssertUnwindSafe<deadpool_diesel::postgres::Pool> =
+                AssertUnwindSafe(connection_pool.clone());
+
+            match catch_unwind(|| perform_job.perform(job.data, &environment, conn_pool.clone())) {
                 Err(e) => {
                     // Panic occurred. No more jobs will be started.
-                    eprintln!("Job {} panicked: {:?}", job_id, e);
+                    let err_message = try_to_extract_panic_info(&e);
+                    eprintln!("Job {} panicked: {:?}", job_id, err_message);
                     storage::update_failed_job(conn, &job_id);
-                    Err(Event::PanicOccurred(e))
+                    Err(JobRunnerError::PanicOccurred(err_message))
                 }
                 Ok(perform_res) => {
                     // The job still could have failed, but we'll re-queue it and carry on.
                     match perform_res {
                         Ok(_) => {
                             if let Err(e) = storage::delete_successful_job(conn, &job_id) {
-                                // TODO
                                 eprintln!("Could not update job {} as succeeded: {}", job_id, e);
                             }
                             Ok(())

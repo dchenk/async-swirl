@@ -48,35 +48,55 @@ impl Error for EnqueueError {
 }
 
 /// An error that occurred performing a job.
-// pub type PerformError = Box<dyn Error>;
-// pub type PerformError = Box<dyn Error + Send>;
 pub type PerformError = String;
 
-/// An error occurred while attempting to fetch jobs from the queue
-// pub enum RunningError {
-//     /// We could not acquire a database connection from the pool.
-//     ///
-//     /// Either the connection pool is too small, or new connections cannot be
-//     /// established.
-//     NoDatabaseConnection(deadpool_diesel::PoolError),
-//
-//     /// Could not execute the query to load a job from the database.
-//     FailedLoadingJob(DieselError),
-//
-//     JobPanicked(PerformError),
-// }
-//
-// impl fmt::Debug for FetchError {
-//     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-//         match self {
-//             FetchError::NoDatabaseConnection(e) => {
-//                 f.debug_tuple("NoDatabaseConnection").field(e).finish()
-//             }
-//             FetchError::FailedLoadingJob(e) => f.debug_tuple("FailedLoadingJob").field(e).finish(),
-//             FetchError::NoMessageReceived => f.debug_struct("NoMessageReceived").finish(),
-//         }
-//     }
-// }
+pub enum JobRunnerError {
+    // UnrecognizedJob is returned when there is an unrecognized job type, and the String holds an
+    // error message with details.
+    UnrecognizedJob(String),
+    PanicOccurred(PerformError),
+    ErrorLoadingJob(diesel::result::Error),
+    FailedToAcquireConnection(deadpool_diesel::PoolError),
+    // TaskExecutionFailed is created when a task cannot be started.
+    TaskExecutionFailed(tokio::task::JoinError),
+    // TxnInternal is created when there's an error processing the transaction.
+    TxnInternal(diesel::result::Error),
+}
+
+impl From<diesel::result::Error> for JobRunnerError {
+    fn from(err: diesel::result::Error) -> Self {
+        JobRunnerError::TxnInternal(err)
+    }
+}
+
+impl std::fmt::Debug for JobRunnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            JobRunnerError::UnrecognizedJob(e) => {
+                f.debug_tuple("UnrecognizedJob").field(e).finish()
+            }
+            JobRunnerError::PanicOccurred(e) => f.debug_tuple("PanicOccurred").field(e).finish(),
+            JobRunnerError::ErrorLoadingJob(e) => {
+                f.debug_tuple("ErrorLoadingJob").field(e).finish()
+            }
+            JobRunnerError::FailedToAcquireConnection(e) => {
+                f.debug_tuple("FailedToAcquireConnection").field(e).finish()
+            }
+            JobRunnerError::TaskExecutionFailed(e) => {
+                f.debug_tuple("TaskExecutionFailed").field(e).finish()
+            }
+            JobRunnerError::TxnInternal(e) => f.debug_tuple("TxnInternal").field(e).finish(),
+        }
+    }
+}
+
+impl std::fmt::Display for JobRunnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        <Self as std::fmt::Debug>::fmt(self, f)
+    }
+}
+
+impl std::error::Error for JobRunnerError {}
 
 /*
 impl fmt::Display for FetchError {
