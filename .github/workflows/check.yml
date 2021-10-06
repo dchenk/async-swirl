@@ -1,0 +1,35 @@
+name: Code checks
+on:
+  - push
+  - pull_request
+jobs:
+  typecheck_and_test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1.0.6
+        with:
+          toolchain: nightly-2021-07-23
+      - run: rustup default nightly-2021-07-23
+      - run: rustup component add rustfmt
+      - run: cargo check
+      - run: cargo test
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1.0.6
+        with:
+          toolchain: nightly-2021-07-23
+      - run: rustup default nightly-2021-07-23
+      - run: rustup component add --toolchain nightly-2021-07-23 clippy rustc-dev
+      - uses: actions/checkout@v2
+        with:
+          repository: rust-lang/rustfmt
+          ref: 8cbee5604a069bf8426f0848fd4fd2c86cfff0fa
+          path: rustfmt
+      - run: cargo install --force --path rustfmt && rm -rf rustfmt
+      - uses: actions/checkout@v2
+      - run: cargo clippy
+      - run: cargo fmt -- --check
