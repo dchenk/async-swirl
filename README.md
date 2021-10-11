@@ -8,28 +8,27 @@ Swirl is a background work queue built on Diesel and PostgreSQL's row locking fe
 of [github.com/sgrif/swirl](https://github.com/sgrif/swirl), which extracted this library from the
 code that powers [crates.io](https://crates.io).
 
-Differences between dchenk/async-swirl and sgrif/swirl:
-- dchenk/async-swirl supports `async` job functions.
-- dchenk/async-swirl leverages Tokio to run jobs, which means that we don't need an additional library
-for thread pooling.
-- dchenk/async-swirl supports only [deadpool](https://crates.io/crates/deadpool) (i.e.,
-[deadpool-diesel](https://crates.io/crates/deadpool-diesel)) for database connection pooling. Although
-this means that dchenk/async-swirl has fewer customization options in this regard, the result is
-_much simpler_ code.
-- dchenk/async-swirl has far more conservative error handling and deliberately ceases to start
-processing new jobs when a fatal (runtime) error occurs processing a job. (This does _not_ mean that
-we cease to start processing new jobs if a job _returns_ an error.)
+Unlike sgrif/swirl, this crate:
+- Supports `async` job functions.
+- Uses Tokio to run jobs, which means that we don't need an additional library for thread pooling.
+- Supports only [deadpool](https://crates.io/crates/deadpool) (i.e., [deadpool-diesel](https://crates.io/crates/deadpool-diesel))
+for database connection pooling. Although this means that dchenk/async-swirl has fewer customization options
+in this regard, the result is _much simpler_ code and a streamlined API.
+- Has far more conservative error handling. For example, we deliberately cease to start processing
+new jobs when we cannot process a job or when a job panics. (This does _not_ mean that we
+cease to start processing new jobs if a job _returns_ an error, in which case the job is re-queued
+and we carry on.)
+- Supports configuring the number of retries to attempt for jobs.
+- Does not delete succeeded jobs from the database and instead keeps track of the status in a column.
 
 This library is still in its early stages and has not yet reached 1.0 status.
 
 ## Getting Started
 
 Swirl stores background jobs in your PostgreSQL 9.5+ database. As such, it has migrations that
-need to be run. At the moment, this should be done by copying our `migrations` directory into
-your own.
+need to be run. At the moment, this is done by copying our `migrations` directory into your own.
 
-Jobs in Swirl are defined as functions annotated with
-`#[swirl::background_job]`, like so:
+Jobs in Swirl are defined as functions annotated with `#[swirl::background_job]` like so:
 
 ```rust
 #[swirl::background_job]
@@ -40,10 +39,10 @@ async fn resize_image(file_name: String, dimensions: Size) -> Result<(), swirl::
 
 All arguments must implement `serde::Serialize` and `serde::DeserializeOwned`. Jobs can also
 take a shared "environment" argument. This is a struct you define, which can contain resources
-shared between jobs like a connection pool, or application level configuration. For example:
+shared between jobs, like a connection pool or application level configuration. For example:
 
 ```rust
-struct Environment {
+pub struct Environment {
     file_server_private_key: String,
     http_client: http_lib::Client,
 }
@@ -55,11 +54,15 @@ async fn resize_image(
     file_name: String,
     dimensions: Size,
 ) -> Result<(), swirl::PerformError> {
-    // Do expensive computation that shouldn't be done on the web server
+    // Do expensive computation that shouldn't be done on the web server.
 }
 ```
 
-Note that all jobs must use the same type for the environment.
+The environment parameter is taken by reference, and all other parameters are owned. All jobs must use
+the same type for the environment.
+
+The database connection parameter must have the type `swirl::DieselPool`, which is a type alias for the
+pool type in `deadpool-diesel`.
 
 Once a job is defined, it can be enqueued like so:
 
@@ -67,11 +70,11 @@ Once a job is defined, it can be enqueued like so:
 resize_image(file_name, dimensions).enqueue(&diesel_connection)?
 ```
 
-You do not pass the environment when enqueuing jobs.
+You do not pass the environment or database connection pool when enqueuing jobs.
 
-Jobs are run asynchronously by an instance of `swirl::Runner`. To construct one, you must first
-pass it the job environment (this is `()` if your jobs don't take an environment), and a `deadpool-diesel`
-connection pool.
+Jobs are run asynchronously by an instance of `swirl::Runner`. You construct a `Runner` by calling its
+associated `builder` method with the required job environment (this is `()` if your jobs don't take an
+environment) and a `deadpool-diesel` connection pool:
 
 ```rust
 let runner = Runner::builder(environment, connection_pool)

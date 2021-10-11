@@ -1,4 +1,4 @@
-use std::panic::{/*catch_unwind, */ AssertUnwindSafe, PanicInfo, RefUnwindSafe, UnwindSafe};
+use std::panic::{AssertUnwindSafe, PanicInfo, RefUnwindSafe, UnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ pub struct Builder<Env> {
     environment: Env,
     concurrency: Option<usize>,
     job_timeout: Option<Duration>,
+    max_retries: Option<usize>,
 }
 
 impl<Env> Builder<Env> {
@@ -34,6 +35,14 @@ impl<Env> Builder<Env> {
         self.job_timeout = Some(timeout);
         self
     }
+
+    /// The maximum number of times to retry a job.
+    ///
+    /// Defaults to 4.
+    pub fn max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = Some(max_retries);
+        self
+    }
 }
 
 impl<Env: UnwindSafe + Send> Builder<Env> {
@@ -45,6 +54,7 @@ impl<Env: UnwindSafe + Send> Builder<Env> {
             registry: Arc::new(Registry::load()),
             concurrency: self.concurrency.unwrap_or(5),
             job_timeout: self.job_timeout.unwrap_or(Duration::from_secs(300)),
+            max_retries: self.max_retries.unwrap_or(4),
         }
     }
 }
@@ -57,6 +67,7 @@ pub struct Runner<Env: UnwindSafe + Send + 'static> {
     registry: Arc<Registry<Env>>,
     concurrency: usize,
     job_timeout: Duration,
+    max_retries: usize,
 }
 
 impl<Env: UnwindSafe + Send> Runner<Env> {
@@ -73,6 +84,7 @@ impl<Env: UnwindSafe + Send> Runner<Env> {
             environment,
             concurrency: None,
             job_timeout: None,
+            max_retries: None,
         }
     }
 }
@@ -88,6 +100,7 @@ where
         use futures::{stream::FuturesUnordered, StreamExt};
 
         let job_timeout = self.job_timeout.clone();
+        let max_retries = self.max_retries as i32;
 
         let do_job = move |connection_pool: DieselPool,
                            environment: Arc<Env>,
@@ -95,6 +108,7 @@ where
             tokio::task::spawn_blocking(move || {
                 tokio::runtime::Handle::current().block_on(Self::run_single_job(
                     job_timeout.clone(),
+                    max_retries,
                     connection_pool,
                     environment,
                     registry,
@@ -148,6 +162,7 @@ where
 
     async fn run_single_job(
         timeout: Duration,
+        max_retries: i32,
         connection_pool: DieselPool,
         environment: Arc<Env>,
         registry: Arc<Registry<Env>>,
@@ -171,7 +186,7 @@ where
         };
 
         conn.transaction::<(), JobRunnerError, _>(|conn| {
-            let job = match storage::find_next_unlocked_job(conn).optional() {
+            let job = match storage::find_next_unlocked_job(conn, max_retries).optional() {
                 Ok(Some(j)) => j,
                 Ok(None) => {
                     // TODO: Make this sleep time configurable.
@@ -187,7 +202,7 @@ where
 
             let perform_job = registry.get(&job.job_type).ok_or_else(|| {
                 JobRunnerError::UnrecognizedJob(format!(
-                    "Unknown job type {} for job {}",
+                    "Unknown job type {} for job {}; it may be that different jobs have different environment types",
                     job.job_type, job_id
                 ))
             })?;
@@ -196,17 +211,19 @@ where
             // after the function that it's passed to panics (i.e., that it is UnwindSafe). Even if
             // it is already safe, we err on the side of caution and deliberately stop processing
             // new jobs whenever a panic occurs.
-            let conn_pool: AssertUnwindSafe<deadpool_diesel::postgres::Pool> =
-                AssertUnwindSafe(connection_pool.clone());
 
             match futures::executor::block_on(tokio::time::timeout(
                 timeout,
-                AssertUnwindSafe(perform_job.perform(job.data, &environment, conn_pool.clone()))
-                    .catch_unwind(),
+                AssertUnwindSafe(perform_job.perform(
+                    job.data,
+                    &environment,
+                    connection_pool.clone(),
+                ))
+                .catch_unwind(),
             )) {
                 Err(_) => {
                     eprintln!("Job {} timed out", job_id);
-                    storage::update_failed_job(conn, &job_id);
+                    storage::update_failed_job(conn, &job_id, job.retries, max_retries);
                     Ok(())
                 }
                 Ok(perform_res) => {
@@ -214,9 +231,9 @@ where
                         Ok(res) => {
                             if let Err(_) = res {
                                 eprintln!("Job {} failed", job_id);
-                                storage::update_failed_job(conn, &job_id);
+                                storage::update_failed_job(conn, &job_id, job.retries, max_retries);
                             } else {
-                                if let Err(e) = storage::delete_successful_job(conn, &job_id) {
+                                if let Err(e) = storage::update_successful_job(conn, &job_id) {
                                     eprintln!(
                                         "Could not update job {} as succeeded: {}",
                                         job_id, e
@@ -229,7 +246,7 @@ where
                             // Panic occurred. No more jobs will be started.
                             let err_message = try_to_extract_panic_info(&e);
                             eprintln!("Job {} panicked: {:?}", job_id, err_message);
-                            storage::update_failed_job(conn, &job_id);
+                            storage::update_failed_job(conn, &job_id, job.retries, max_retries);
                             Err(JobRunnerError::PanicOccurred(err_message))
                         }
                     }
@@ -268,7 +285,6 @@ mod tests {
 
     use super::*;
 
-    /*
     #[test]
     fn jobs_are_locked_when_fetched() {
         let _guard = TestGuard::lock();
@@ -298,6 +314,7 @@ mod tests {
         runner.wait_for_jobs().unwrap();
     }
 
+    /*
     #[test]
     fn jobs_are_deleted_when_successfully_run() {
         let _guard = TestGuard::lock();
@@ -432,9 +449,13 @@ mod tests {
         crate::Runner::builder((), pool).concurrency(2).build()
     }
 
-    fn create_dummy_job(runner: &Runner<()>) -> storage::BackgroundJob {
+    fn create_dummy_job(runner: &Runner<()>, db_conn: &mut PgConnection) -> storage::BackgroundJob {
         ::diesel::insert_into(background_jobs)
-            .values((job_type.eq("Foo"), data.eq(serde_json::json!(null))))
+            .values((
+                id.eq(min_id::generate_id()),
+                job_type.eq("Foo"),
+                data.eq(serde_json::json!(null)),
+            ))
             .returning((id, job_type, data))
             .get_result(&*runner.connection().unwrap())
             .unwrap()

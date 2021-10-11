@@ -167,13 +167,15 @@ impl JobArgs {
             match (&env_arg, &connection_arg, Arg::try_from(pat_type)?) {
                 (None, _, Arg::Env(arg)) => env_arg = Some(arg),
                 (Some(_), _, Arg::Env(_)) => {
-                    return Err(span.error("Background jobs cannot take references as arguments"));
+                    return Err(
+                        span.error("Background job functions cannot take references as arguments")
+                    );
                 }
                 (_, ConnectionArg::None, Arg::Connection(arg)) => connection_arg = arg,
                 (_, _, Arg::Connection(_)) => {
                     return Err(
-                        span.error("Multiple database connection arguments")
-                            .help("To take a connection pool as an argument, use the type `swirl::DieselPool` as the second argument")
+                        span.error("Multiple database connection arguments in job function")
+                            .help("To take a connection pool as an argument, define an argument of the type`swirl::DieselPool`")
                     );
                 }
                 (_, _, Arg::Normal(pat_type)) => args.push(pat_type),
@@ -229,7 +231,6 @@ impl Arg {
             // This can only be an Env argument.
             Ok(Arg::Env(EnvArg { pat, ty }))
         } else if let syn::Type::Path(type_path) = pat_type.ty.as_ref() {
-            // ConnectionArg::is_connection_arg(&ty) {
             if ConnectionArg::is_connection_arg(type_path) {
                 if let syn::Pat::Ident(pool_ident) = *pat_type.pat {
                     Ok(Arg::Connection(ConnectionArg::Pool(pool_ident.ident)))
@@ -282,7 +283,6 @@ impl ConnectionArg {
         }
     }
 
-    // TODO: async/await
     fn wrap(&self, body: Vec<syn::Stmt>) -> TokenStream {
         quote!(#(#body)*)
     }

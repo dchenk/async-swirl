@@ -23,7 +23,14 @@ impl<Env: UnwindSafe + Send + 'static> Registry<Env> {
     pub fn load() -> Self {
         let jobs = inventory::iter::<JobVTable>
             .into_iter()
-            .filter(|vtable| vtable.env_type == TypeId::of::<Env>())
+            .filter(|vtable| {
+                if vtable.env_type == TypeId::of::<Env>() {
+                    true
+                } else {
+                    eprintln!("Job type {} has an unrecognized Environment type", vtable.job_type);
+                    false
+                }
+            })
             .map(|vtable| (vtable.job_type, vtable.clone()))
             .collect();
 
