@@ -21,6 +21,9 @@ pub use swirl_proc_macro::*;
 #[doc(hidden)]
 pub use serde_derive::{Deserialize, Serialize};
 
+#[doc(hidden)]
+pub use async_trait;
+
 pub use errors::*;
 pub use job::*;
 pub use registry::Registry;

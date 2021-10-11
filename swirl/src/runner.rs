@@ -1,9 +1,8 @@
-use std::panic::{catch_unwind, AssertUnwindSafe, PanicInfo, RefUnwindSafe};
+use std::panic::{/*catch_unwind, */ AssertUnwindSafe, PanicInfo, RefUnwindSafe, UnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
 use diesel::prelude::*;
-use futures::stream::FuturesUnordered;
 
 use crate::errors::*;
 use crate::{storage, DieselPool, Registry};
@@ -37,8 +36,8 @@ impl<Env> Builder<Env> {
     }
 }
 
-impl<Env> Builder<Env> {
-    /// Build the runner
+impl<Env: UnwindSafe + Send> Builder<Env> {
+    /// Build the runner.
     pub fn build(self) -> Runner<Env> {
         Runner {
             connection_pool: self.connection_pool,
@@ -52,7 +51,7 @@ impl<Env> Builder<Env> {
 
 #[allow(missing_debug_implementations)]
 /// The core runner responsible for locking and running jobs.
-pub struct Runner<Env: 'static> {
+pub struct Runner<Env: UnwindSafe + Send + 'static> {
     connection_pool: deadpool_diesel::postgres::Pool,
     environment: Arc<Env>,
     registry: Arc<Registry<Env>>,
@@ -60,7 +59,7 @@ pub struct Runner<Env: 'static> {
     job_timeout: Duration,
 }
 
-impl<Env> Runner<Env> {
+impl<Env: UnwindSafe + Send> Runner<Env> {
     /// Create a builder for a Runner.
     ///
     /// This method takes the two required configurations: the database connection pool
@@ -80,13 +79,13 @@ impl<Env> Runner<Env> {
 
 impl<Env> Runner<Env>
 where
-    Env: RefUnwindSafe + Send + Sync + 'static,
+    Env: UnwindSafe + RefUnwindSafe + Send + Sync + 'static,
 {
     /// Runs all pending jobs in the queue and continue to pick up and run jobs until an
     /// error processing jobs occurs or until a job panics. This function does not stop
     /// when a normal error occurs within the execution of a job.
     pub async fn start(&self) -> Result<(), JobRunnerError> {
-        use futures::StreamExt;
+        use futures::{stream::FuturesUnordered, StreamExt};
 
         let job_timeout = self.job_timeout.clone();
 
@@ -94,18 +93,14 @@ where
                            environment: Arc<Env>,
                            registry: Arc<Registry<Env>>| {
             tokio::task::spawn_blocking(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap()
-                    .block_on(tokio::time::timeout(
-                        job_timeout.clone(),
-                        Self::run_single_job(connection_pool, environment, registry),
-                    ))
+                tokio::runtime::Handle::current().block_on(Self::run_single_job(
+                    job_timeout.clone(),
+                    connection_pool,
+                    environment,
+                    registry,
+                ))
             })
         };
-
-        let max_threads = self.concurrency;
 
         let mut async_tasks = FuturesUnordered::new();
 
@@ -118,10 +113,10 @@ where
                 biased;
 
                 _ = async {}, if err.is_some() && running_tasks == 0 => {
-                    println!("Shutting down");
+                    eprintln!("Shutting down due to error");
                     return Err(err.unwrap());
                 }
-                _ = async {}, if err.is_none() && running_tasks < max_threads => {
+                _ = async {}, if err.is_none() && running_tasks < self.concurrency => {
                     async_tasks.push(do_job(self.connection_pool.clone(), self.environment.clone(), self.registry.clone()));
                 }
                 job_run_res = async_tasks.select_next_some() => {
@@ -129,25 +124,17 @@ where
                     match job_run_res {
                         Err(join_err) => {
                             err = Some(JobRunnerError::TaskExecutionFailed(join_err));
+                            async_tasks.push(do_job(self.connection_pool.clone(), self.environment.clone(), self.registry.clone()));
                         }
-                        Ok(job_timeout_res) => {
-                            match job_timeout_res {
-                                Ok(job_res) => {
-                                    match job_res {
-                                        Ok(_) => {
-                                            if err.is_none() {
-                                                async_tasks.push(do_job(self.connection_pool.clone(), self.environment.clone(), self.registry.clone()));
-                                            }
-                                        },
-                                        Err(e) => {
-                                            err = Some(e);
-                                        }
+                        Ok(job_res) => {
+                            match job_res {
+                                Ok(_) => {
+                                    if err.is_none() {
+                                        async_tasks.push(do_job(self.connection_pool.clone(), self.environment.clone(), self.registry.clone()));
                                     }
-                                }
+                                },
                                 Err(e) => {
-                                    // The job timed out. Keep taking on more jobs.
-                                    eprintln!("Job timed out: {}", e);
-                                    async_tasks.push(do_job(self.connection_pool.clone(), self.environment.clone(), self.registry.clone()));
+                                    err = Some(e);
                                 }
                             }
                         }
@@ -160,10 +147,13 @@ where
     }
 
     async fn run_single_job(
+        timeout: Duration,
         connection_pool: DieselPool,
         environment: Arc<Env>,
         registry: Arc<Registry<Env>>,
     ) -> Result<(), JobRunnerError> {
+        use futures::FutureExt;
+
         let conn_wrapper = match connection_pool.get().await {
             Ok(cw) => cw,
             Err(e) => {
@@ -184,7 +174,8 @@ where
             let job = match storage::find_next_unlocked_job(conn).optional() {
                 Ok(Some(j)) => j,
                 Ok(None) => {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    // TODO: Make this sleep time configurable.
+                    std::thread::sleep(Duration::from_secs(2));
                     return Ok(());
                 }
                 Err(e) => {
@@ -208,27 +199,38 @@ where
             let conn_pool: AssertUnwindSafe<deadpool_diesel::postgres::Pool> =
                 AssertUnwindSafe(connection_pool.clone());
 
-            match catch_unwind(|| perform_job.perform(job.data, &environment, conn_pool.clone())) {
-                Err(e) => {
-                    // Panic occurred. No more jobs will be started.
-                    let err_message = try_to_extract_panic_info(&e);
-                    eprintln!("Job {} panicked: {:?}", job_id, err_message);
+            match futures::executor::block_on(tokio::time::timeout(
+                timeout,
+                AssertUnwindSafe(perform_job.perform(job.data, &environment, conn_pool.clone()))
+                    .catch_unwind(),
+            )) {
+                Err(_) => {
+                    eprintln!("Job {} timed out", job_id);
                     storage::update_failed_job(conn, &job_id);
-                    Err(JobRunnerError::PanicOccurred(err_message))
+                    Ok(())
                 }
                 Ok(perform_res) => {
-                    // The job still could have failed, but we'll re-queue it and carry on.
                     match perform_res {
-                        Ok(_) => {
-                            if let Err(e) = storage::delete_successful_job(conn, &job_id) {
-                                eprintln!("Could not update job {} as succeeded: {}", job_id, e);
+                        Ok(res) => {
+                            if let Err(_) = res {
+                                eprintln!("Job {} failed", job_id);
+                                storage::update_failed_job(conn, &job_id);
+                            } else {
+                                if let Err(e) = storage::delete_successful_job(conn, &job_id) {
+                                    eprintln!(
+                                        "Could not update job {} as succeeded: {}",
+                                        job_id, e
+                                    );
+                                }
                             }
                             Ok(())
                         }
                         Err(e) => {
-                            eprintln!("Job {} failed: {}", job_id, e);
+                            // Panic occurred. No more jobs will be started.
+                            let err_message = try_to_extract_panic_info(&e);
+                            eprintln!("Job {} panicked: {:?}", job_id, err_message);
                             storage::update_failed_job(conn, &job_id);
-                            Ok(())
+                            Err(JobRunnerError::PanicOccurred(err_message))
                         }
                     }
                 }

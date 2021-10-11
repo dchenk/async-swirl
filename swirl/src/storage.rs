@@ -8,7 +8,7 @@ use crate::errors::EnqueueError;
 use crate::schema::background_jobs;
 use crate::Job;
 
-#[derive(Queryable, Identifiable, Debug, Clone)]
+#[derive(Queryable, Identifiable, Insertable, Debug, Clone)]
 pub struct BackgroundJob {
     pub id: String,
     pub job_type: String,
@@ -21,7 +21,11 @@ pub fn enqueue_job<T: Job>(conn: &mut PgConnection, job: T) -> Result<(), Enqueu
 
     let job_data = serde_json::to_value(job)?;
     insert_into(background_jobs)
-        .values((job_type.eq(T::JOB_TYPE), data.eq(job_data)))
+        .values(BackgroundJob {
+            id: min_id::generate_id(),
+            job_type: T::JOB_TYPE.to_owned(),
+            data: job_data,
+        })
         .execute(conn)?;
     Ok(())
 }

@@ -1,9 +1,9 @@
-use crate::diagnostic_shim::*;
 use proc_macro2::TokenStream;
 use quote::quote;
-use std::borrow::Cow;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
+
+use crate::diagnostic_shim::*;
 
 pub fn expand(item: syn::ItemFn) -> Result<TokenStream, Diagnostic> {
     let job = BackgroundJob::try_from(item)?;
@@ -31,11 +31,12 @@ pub fn expand(item: syn::ItemFn) -> Result<TokenStream, Diagnostic> {
             }
         }
 
+        #[swirl::async_trait::async_trait]
         impl swirl::Job for #name :: Job {
             type Environment = #env_type;
             const JOB_TYPE: &'static str = stringify!(#name);
 
-            #fn_token perform(self, #env_pat: &Self::Environment, #pool_pat: swirl::DieselPool) #return_type {
+            async #fn_token perform(self, #env_pat: &Self::Environment, #pool_pat: swirl::DieselPool) #return_type {
                 let Self { #(#arg_names),* } = self;
                 #body
             }
@@ -53,6 +54,7 @@ pub fn expand(item: syn::ItemFn) -> Result<TokenStream, Diagnostic> {
             swirl::register_job!(Job);
         }
     };
+
     Ok(res)
 }
 
@@ -86,12 +88,6 @@ impl BackgroundJob {
                 .span
                 .error("#[swirl::background_job] cannot be used on unsafe functions"));
         }
-
-        // if let Some(asyncness) = sig.asyncness {
-        //     return Err(asyncness
-        //         .span
-        //         .error("#[swirl::background_job] cannot be used on async functions"));
-        // }
 
         if let Some(abi) = sig.abi {
             return Err(abi
@@ -230,10 +226,20 @@ impl Arg {
             }
             let pat = pat_type.pat;
             let ty = type_ref.elem;
-            if ConnectionArg::is_connection_arg(&ty) {
-                Ok(Arg::Connection(ConnectionArg::from_arg(pat, ty)))
+            // This can only be an Env argument.
+            Ok(Arg::Env(EnvArg { pat, ty }))
+        } else if let syn::Type::Path(type_path) = pat_type.ty.as_ref() {
+            // ConnectionArg::is_connection_arg(&ty) {
+            if ConnectionArg::is_connection_arg(type_path) {
+                if let syn::Pat::Ident(pool_ident) = *pat_type.pat {
+                    Ok(Arg::Connection(ConnectionArg::Pool(pool_ident.ident)))
+                } else {
+                    Err(pat_type
+                        .span()
+                        .error("Expected an identifier for the DB connection parameter"))
+                }
             } else {
-                Ok(Arg::Env(EnvArg { pat, ty }))
+                Ok(Arg::Normal(pat_type))
             }
         } else {
             Ok(Arg::Normal(pat_type))
@@ -257,50 +263,22 @@ impl Default for EnvArg {
 
 enum ConnectionArg {
     None,
-    // SingleConnection(Box<syn::Pat>),
-    Pool(Box<syn::Pat>, Box<syn::Type>),
+    Pool(syn::Ident),
 }
 
 impl ConnectionArg {
-    fn is_pool(ty: &syn::Type) -> bool {
-        if let syn::Type::TraitObject(type_trait_object) = ty {
-            type_trait_object.bounds.iter().any(|bound| {
-                if let syn::TypeParamBound::Trait(trait_bound) = bound {
-                    path_ends_with(&trait_bound.path, "DieselPool")
-                } else {
-                    false
-                }
-            })
-        } else {
-            false
-        }
+    fn is_connection_arg(tp: &syn::TypePath) -> bool {
+        path_ends_with(&tp.path, "DieselPool")
     }
 
-    fn is_connection_arg(ty: &syn::Type) -> bool {
-        Self::is_pool(ty)
-    }
-
-    fn from_arg(pat: Box<syn::Pat>, ty: Box<syn::Type>) -> Self {
-        // if Self::is_single_connection(&ty) {
-        //     ConnectionArg::SingleConnection(pat)
-        // } else
-        if Self::is_pool(&ty) {
-            ConnectionArg::Pool(pat, ty)
-        } else {
-            ConnectionArg::None
-        }
-    }
-
-    fn pool_pat(&self) -> Cow<'_, syn::Pat> {
+    fn pool_pat(&self) -> syn::Pat {
         match self {
-            // ConnectionArg::None => Cow::Owned(syn::parse_quote!(_)),
-            ConnectionArg::None => Cow::Owned(syn::parse_quote!(_)),
-            // ConnectionArg::SingleConnection(_) => {
-            //     Cow::Owned(syn::parse_quote!(__swirl_connection_pool))
-            // }
-            // ConnectionArg::Pool(pat, _) => Cow::Borrowed(pat),
-            // ConnectionArg::Pool(pat, _) => Cow::Owned(syn::parse_quote!(__swirl_connection_pool)),
-            ConnectionArg::Pool(pat, _) => Cow::Owned(syn::parse_quote!(#pat)),
+            ConnectionArg::None => {
+                syn::parse_quote!(_)
+            }
+            ConnectionArg::Pool(arg_name) => {
+                syn::parse_quote!(#arg_name)
+            }
         }
     }
 
