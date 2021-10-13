@@ -4,8 +4,10 @@ use std::time::Duration;
 
 use diesel::prelude::*;
 
+use crate::{DieselPool, Registry, storage};
 use crate::errors::*;
-use crate::{storage, DieselPool, Registry};
+use crate::registry::PerformJob;
+use diesel::connection::{AnsiTransactionManager, TransactionManager};
 
 pub struct NoConnectionPoolGiven;
 
@@ -59,6 +61,11 @@ impl<Env: UnwindSafe + Send> Builder<Env> {
     }
 }
 
+enum RunResult {
+    JobNotFound(String),
+    JobResult(Result<Result<Result<(), Result<Option<PerformError>, JobRunnerError>>, Box<dyn std::any::Any + Send>>, tokio::time::error::Elapsed>)
+}
+
 #[allow(missing_debug_implementations)]
 /// The core runner responsible for locking and running jobs.
 pub struct Runner<Env: UnwindSafe + Send + 'static> {
@@ -97,7 +104,8 @@ where
     /// error processing jobs occurs or until a job panics. This function does not stop
     /// when a normal error occurs within the execution of a job.
     pub async fn start(&self) -> Result<(), JobRunnerError> {
-        use futures::{stream::FuturesUnordered, StreamExt};
+        use futures::{stream::FuturesUnordered, StreamExt, FutureExt};
+        // use futures::FutureExt;
 
         let job_timeout = self.job_timeout.clone();
         let max_retries = self.max_retries as i32;
@@ -107,11 +115,89 @@ where
                            registry: Arc<Registry<Env>>| {
             tokio::task::spawn_blocking(move || {
                 tokio::runtime::Handle::current().block_on(Self::run_single_job(
-                    job_timeout.clone(),
+                    // job_timeout.clone(),
                     max_retries,
                     connection_pool,
-                    environment,
-                    registry,
+                    // environment,
+                    // registry,
+                    move |job| {
+                        // match registry.get(&job.job_type).ok_or_else(|| {
+                        //     // JobRunnerError::UnrecognizedJob(format!(
+                        //     //     "Unknown job type {} for job {}; it may be that different jobs have different environment types",
+                        //     //     job.job_type, job.id
+                        //     // ))
+                        //     Ok(
+                        //         Ok(
+                        //             JobRunnerError::UnrecognizedJob(format!(
+                        //                 "Unknown job type {} for job {}; it may be that different jobs have different environment types",
+                        //                 job.job_type, job.id
+                        //             ))
+                        //         )
+                        //     )
+                        // }) {
+                        //    Err(e) => {
+                        //        let _x: Result<Result<i32, ()>, ()> = e;
+                        //    }
+                        //     Ok(v) => {}
+                        // };
+                        // let perform_job: PerformJob<Env> = registry.get(&job.job_type).ok_or_else(|| -> Result<Result<Result<(), PerformError>, Box<dyn std::any::Any + Send>>, tokio::time::error::Elapsed> {
+                        //     // JobRunnerError::UnrecognizedJob(format!(
+                        //     //     "Unknown job type {} for job {}; it may be that different jobs have different environment types",
+                        //     //     job.job_type, job.id
+                        //     // ))
+                        //     Result::<_, tokio::time::error::Elapsed>::Ok(
+                        //         Ok(
+                        //         Err(JobRunnerError::UnrecognizedJob(format!(
+                        //             "Unknown job type {} for job {}; it may be that different jobs have different environment types",
+                        //             job.job_type, job.id
+                        //         )))
+                        //         )
+                        //     )
+                        // })?;
+                        let perform_job: PerformJob<Env> = registry.get(&job.job_type).ok_or_else(|| -> Result<Result<Result<(), PerformError>, Box<dyn std::any::Any + Send>>, tokio::time::error::Elapsed> {
+                            // JobRunnerError::UnrecognizedJob(format!(
+                            //     "Unknown job type {} for job {}; it may be that different jobs have different environment types",
+                            //     job.job_type, job.id
+                            // ))
+                            Result::<_, tokio::time::error::Elapsed>::Ok(
+                                Ok(
+                                    Err(JobRunnerError::UnrecognizedJob(format!(
+                                        "Unknown job type {} for job {}; it may be that different jobs have different environment types",
+                                        job.job_type, job.id
+                                    )))
+                                )
+                            )
+                        })?;
+                        // AssertUnwindSafe(perform_job.perform(
+                        //     job.data,
+                        //     &environment,
+                        //     connection_pool.clone(),
+                        // ))
+                        // perform_job.perform(
+                        //     job.data,
+                        //     &environment,
+                        //     connection_pool.clone(),
+                        // )
+                        // futures::executor::block_on(tokio::time::timeout(
+                        //     job_timeout,
+                        //     AssertUnwindSafe(perform_job.perform(
+                        //         job.data,
+                        //         &environment,
+                        //         connection_pool.clone(),
+                        //     ))
+                        //     .catch_unwind()
+                        // ))
+                        tokio::time::timeout(
+                            job_timeout,
+                            AssertUnwindSafe(perform_job.perform(
+                                job.data,
+                                &environment,
+                                connection_pool.clone(),
+                            ))
+                                .catch_unwind()
+                        )
+                        // )) {
+                    }
                 ))
             })
         };
@@ -160,15 +246,15 @@ where
         // TODO: Catch CTRL+C and return Ok(())
     }
 
-    async fn run_single_job(
-        timeout: Duration,
+    async fn run_single_job<F>(
         max_retries: i32,
         connection_pool: DieselPool,
-        environment: Arc<Env>,
-        registry: Arc<Registry<Env>>,
-    ) -> Result<(), JobRunnerError> {
-        use futures::FutureExt;
-
+        job_fn: F,
+    ) -> Result<(), JobRunnerError>
+    where
+        // F: FnOnce(storage::BackgroundJob) -> Result<Result<Result<(), Result<Option<PerformError>, JobRunnerError>>, Box<dyn std::any::Any + Send>>, tokio::time::error::Elapsed> + 'static,
+        F: FnOnce(storage::BackgroundJob) -> RunResult + 'static,
+    {
         let conn_wrapper = match connection_pool.get().await {
             Ok(cw) => cw,
             Err(e) => {
@@ -176,7 +262,7 @@ where
             }
         };
 
-        let mut conn = match conn_wrapper.lock() {
+        let mut conn: &mut PgConnection = match conn_wrapper.lock() {
             Ok(conn) => conn,
             Err(_e) => {
                 return Err(JobRunnerError::FailedToAcquireConnection(
@@ -185,45 +271,63 @@ where
             }
         };
 
-        conn.transaction::<(), JobRunnerError, _>(|conn| {
+        AnsiTransactionManager::begin_transaction(&mut conn)
+        // conn.execute("BEGIN")
+            .map_err(|| {
+                todo!()
+            })?;
+
+        // conn.transaction::<(), JobRunnerError, _>(|conn| {
             let job = match storage::find_next_unlocked_job(conn, max_retries).optional() {
                 Ok(Some(j)) => j,
                 Ok(None) => {
+                    AnsiTransactionManager::commit_transaction(&mut conn)
+                        .map_err(|| {
+                            todo!()
+                        })?;
                     // TODO: Make this sleep time configurable.
                     std::thread::sleep(Duration::from_secs(2));
                     return Ok(());
                 }
                 Err(e) => {
+                    AnsiTransactionManager::rollback_transaction(&mut conn)
+                        .map_err(|| {
+                            todo!()
+                        })?;
                     return Err(JobRunnerError::ErrorLoadingJob(e));
                 }
             };
 
             let job_id = job.id.clone();
 
-            let perform_job = registry.get(&job.job_type).ok_or_else(|| {
-                JobRunnerError::UnrecognizedJob(format!(
-                    "Unknown job type {} for job {}; it may be that different jobs have different environment types",
-                    job.job_type, job_id
-                ))
-            })?;
+            // let perform_job: PerformJob<Env> = registry.get(&job.job_type).ok_or_else(|| {
+            //     JobRunnerError::UnrecognizedJob(format!(
+            //         "Unknown job type {} for job {}; it may be that different jobs have different environment types",
+            //         job.job_type, job_id
+            //     ))
+            // })?;
 
             // We don't have a guarantee that the Pool ends up in an internally consistent state
             // after the function that it's passed to panics (i.e., that it is UnwindSafe). Even if
             // it is already safe, we err on the side of caution and deliberately stop processing
             // new jobs whenever a panic occurs.
 
-            match futures::executor::block_on(tokio::time::timeout(
-                timeout,
-                AssertUnwindSafe(perform_job.perform(
-                    job.data,
-                    &environment,
-                    connection_pool.clone(),
-                ))
-                .catch_unwind(),
-            )) {
+            let retries = job.retries;
+
+            // match futures::executor::block_on(tokio::time::timeout(
+            //     timeout,
+            //     // AssertUnwindSafe(perform_job.perform(
+            //     //     job.data,
+            //     //     &environment,
+            //     //     connection_pool.clone(),
+            //     // ))
+            //     f(job)
+            //     .catch_unwind(),
+            // )) {
+            match job_fn(job) {
                 Err(_) => {
                     eprintln!("Job {} timed out", job_id);
-                    storage::update_failed_job(conn, &job_id, job.retries, max_retries);
+                    storage::update_failed_job(conn, &job_id, retries, max_retries);
                     Ok(())
                 }
                 Ok(perform_res) => {
@@ -231,7 +335,7 @@ where
                         Ok(res) => {
                             if let Err(_) = res {
                                 eprintln!("Job {} failed", job_id);
-                                storage::update_failed_job(conn, &job_id, job.retries, max_retries);
+                                storage::update_failed_job(conn, &job_id, retries, max_retries);
                             } else {
                                 if let Err(e) = storage::update_successful_job(conn, &job_id) {
                                     eprintln!(
@@ -246,13 +350,13 @@ where
                             // Panic occurred. No more jobs will be started.
                             let err_message = try_to_extract_panic_info(&e);
                             eprintln!("Job {} panicked: {:?}", job_id, err_message);
-                            storage::update_failed_job(conn, &job_id, job.retries, max_retries);
+                            storage::update_failed_job(conn, &job_id, retries, max_retries);
                             Err(JobRunnerError::PanicOccurred(err_message))
                         }
                     }
                 }
             }
-        })
+        // })
     }
 }
 
@@ -297,12 +401,9 @@ mod tests {
         let return_barrier = Arc::new(AssertUnwindSafe(Barrier::new(2)));
         let return_barrier2 = return_barrier.clone();
 
-        runner.get_single_job(channel::dummy_sender(), move |job| {
-            fetch_barrier.0.wait(); // Tell thread 2 it can lock its job
-            assert_eq!(first_job_id, job.id);
-            return_barrier.0.wait(); // Wait for thread 2 to lock its job
-            Ok(())
-        });
+        let pool = db_pool();
+
+        Runner::run_single_job(std::time::Duration::from_secs(10), 3, pool, Arc::new(()), todo!());
 
         fetch_barrier2.0.wait(); // Wait until thread 1 locks its job
         runner.get_single_job(channel::dummy_sender(), move |job| {
@@ -430,9 +531,7 @@ mod tests {
         }
     }
 
-    type Runner<Env> = crate::Runner<Env>;
-
-    fn runner() -> Runner<()> {
+    fn db_pool() -> DieselPool {
         let database_url =
             dotenv::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set to run tests");
 
@@ -441,12 +540,14 @@ mod tests {
             deadpool_diesel::Runtime::Tokio1,
         );
 
-        let pool = deadpool_diesel::postgres::Pool::builder(pool_manager)
-            .max_size(5)
+        deadpool_diesel::postgres::Pool::builder(pool_manager)
+            .max_size(3)
             .build()
-            .unwrap();
+            .unwrap()
+    }
 
-        crate::Runner::builder((), pool).concurrency(2).build()
+    fn runner() -> Runner<()> {
+        Runner::builder((), db_pool()).concurrency(2).build()
     }
 
     fn create_dummy_job(runner: &Runner<()>, db_conn: &mut PgConnection) -> storage::BackgroundJob {
@@ -455,9 +556,10 @@ mod tests {
                 id.eq(min_id::generate_id()),
                 job_type.eq("Foo"),
                 data.eq(serde_json::json!(null)),
+                status.eq("Queued"),
             ))
             .returning((id, job_type, data))
-            .get_result(&*runner.connection().unwrap())
+            .get_result(db_conn)
             .unwrap()
     }
 }

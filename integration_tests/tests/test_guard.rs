@@ -76,7 +76,7 @@ impl<'a, Env> Deref for TestGuard<'a, Env> {
     }
 }
 
-impl<'a, Env> DerefMut for TestGuard<'a, Env> {
+impl<'a, Env: Send> DerefMut for TestGuard<'a, Env> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.runner
     }

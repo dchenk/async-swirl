@@ -8,5 +8,5 @@ CREATE TABLE background_jobs (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-create index background_jobs_created_at_filtered_idx on background_jobs2 (created_at)
+create index background_jobs_created_at_filtered_idx on background_jobs (created_at)
 where status IN ('Queued', 'FailedReQueued');
