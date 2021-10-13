@@ -18,15 +18,13 @@ lazy_static::lazy_static! {
 }
 
 pub struct TestGuard<'a, Env: 'static> {
-    runner: Runner<Env, DieselPool>,
+    runner: Runner<Env>,
     _lock: MutexGuard<'a, ()>,
 }
 
 impl<'a, Env> TestGuard<'a, Env> {
     pub fn builder(env: Env) -> GuardBuilder<Env> {
-        let database_url =
-            dotenv::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set to run tests");
-        let builder = Runner::builder(env).connection_pool_builder(database_url, pool_builder());
+        let builder = Runner::builder(env, build_pool());
 
         GuardBuilder { builder }
     }
@@ -43,7 +41,7 @@ impl<'a> TestGuard<'a, ()> {
 }
 
 pub struct GuardBuilder<Env: 'static> {
-    builder: Builder<Env, PoolBuilder>,
+    builder: Builder<Env>,
 }
 
 impl<Env> GuardBuilder<Env> {
@@ -57,8 +55,8 @@ impl<Env> GuardBuilder<Env> {
         self
     }
 
-    pub fn job_start_timeout(mut self, timeout: Duration) -> Self {
-        self.builder = self.builder.job_start_timeout(timeout);
+    pub fn job_timeout(mut self, timeout: Duration) -> Self {
+        self.builder = self.builder.job_timeout(timeout);
         self
     }
 
@@ -71,14 +69,14 @@ impl<Env> GuardBuilder<Env> {
 }
 
 impl<'a, Env> Deref for TestGuard<'a, Env> {
-    type Target = Runner<Env, DieselPool>;
+    type Target = Runner<Env>;
 
     fn deref(&self) -> &Self::Target {
         &self.runner
     }
 }
 
-impl<'a, Env> DerefMut for TestGuard<'a, Env> {
+impl<'a, Env: Send> DerefMut for TestGuard<'a, Env> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.runner
     }

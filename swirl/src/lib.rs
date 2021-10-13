@@ -13,7 +13,6 @@ mod registry;
 mod runner;
 mod storage;
 
-pub mod db;
 pub mod errors;
 pub mod schema;
 
@@ -22,6 +21,9 @@ pub use swirl_proc_macro::*;
 #[doc(hidden)]
 pub use serde_derive::{Deserialize, Serialize};
 
+#[doc(hidden)]
+pub use async_trait;
+
 pub use errors::*;
 pub use job::*;
 pub use registry::Registry;
@@ -29,3 +31,5 @@ pub use runner::*;
 
 #[doc(hidden)]
 pub use registry::JobVTable;
+
+pub type DieselPool = deadpool_diesel::postgres::Pool;

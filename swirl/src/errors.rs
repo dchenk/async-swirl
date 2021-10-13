@@ -1,10 +1,13 @@
-use diesel::result::Error as DieselError;
 use std::error::Error;
 use std::fmt;
+use std::sync::PoisonError;
 
-use crate::db::DieselPool;
+use diesel::result::Error as DieselError;
 
-/// An error occurred queueing the job
+pub use FailedJobsError::JobsFailed;
+pub use FailedJobsError::PanicOccurred;
+
+/// An error that occurred queueing a job.
 #[derive(Debug)]
 pub enum EnqueueError {
     /// An error occurred serializing the job
@@ -12,10 +15,6 @@ pub enum EnqueueError {
 
     /// An error occurred inserting the job into the database
     DatabaseError(DieselError),
-
-    #[doc(hidden)]
-    /// Match on `_` instead, more variants may be added in the future
-    __NonExhaustive,
 }
 
 impl From<serde_json::error::Error> for EnqueueError {
@@ -35,7 +34,6 @@ impl fmt::Display for EnqueueError {
         match self {
             EnqueueError::SerializationError(e) => e.fmt(f),
             EnqueueError::DatabaseError(e) => e.fmt(f),
-            EnqueueError::__NonExhaustive => unreachable!(),
         }
     }
 }
@@ -45,44 +43,63 @@ impl Error for EnqueueError {
         match self {
             EnqueueError::SerializationError(e) => Some(e),
             EnqueueError::DatabaseError(e) => Some(e),
-            EnqueueError::__NonExhaustive => unreachable!(),
         }
     }
 }
 
-/// An error occurred performing the job
-pub type PerformError = Box<dyn Error>;
+/// An error that occurred performing a job.
+pub type PerformError = String;
 
-/// An error occurred while attempting to fetch jobs from the queue
-pub enum FetchError<Pool: DieselPool> {
-    /// We could not acquire a database connection from the pool.
-    ///
-    /// Either the connection pool is too small, or new connections cannot be
-    /// established.
-    NoDatabaseConnection(Pool::Error),
-
-    /// Could not execute the query to load a job from the database.
-    FailedLoadingJob(DieselError),
-
-    /// No message was received from the worker thread.
-    ///
-    /// Either the thread pool is too small, or jobs have hung indefinitely
-    NoMessageReceived,
+pub enum JobRunnerError {
+    // UnrecognizedJob is returned when there is an unrecognized job type, and the String holds an
+    // error message with details.
+    UnrecognizedJob(String),
+    PanicOccurred(PerformError),
+    ErrorLoadingJob(diesel::result::Error),
+    FailedToAcquireConnection(deadpool_diesel::PoolError),
+    // TaskExecutionFailed is created when a task cannot be started.
+    TaskExecutionFailed(tokio::task::JoinError),
+    // TxnInternal is created when there's an error processing the transaction.
+    TxnInternal(diesel::result::Error),
 }
 
-impl<Pool: DieselPool> fmt::Debug for FetchError<Pool> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl From<diesel::result::Error> for JobRunnerError {
+    fn from(err: diesel::result::Error) -> Self {
+        JobRunnerError::TxnInternal(err)
+    }
+}
+
+impl std::fmt::Debug for JobRunnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            FetchError::NoDatabaseConnection(e) => {
-                f.debug_tuple("NoDatabaseConnection").field(e).finish()
+            JobRunnerError::UnrecognizedJob(e) => {
+                f.debug_tuple("UnrecognizedJob").field(e).finish()
             }
-            FetchError::FailedLoadingJob(e) => f.debug_tuple("FailedLoadingJob").field(e).finish(),
-            FetchError::NoMessageReceived => f.debug_struct("NoMessageReceived").finish(),
+            JobRunnerError::PanicOccurred(e) => f.debug_tuple("PanicOccurred").field(e).finish(),
+            JobRunnerError::ErrorLoadingJob(e) => {
+                f.debug_tuple("ErrorLoadingJob").field(e).finish()
+            }
+            JobRunnerError::FailedToAcquireConnection(e) => {
+                f.debug_tuple("FailedToAcquireConnection").field(e).finish()
+            }
+            JobRunnerError::TaskExecutionFailed(e) => {
+                f.debug_tuple("TaskExecutionFailed").field(e).finish()
+            }
+            JobRunnerError::TxnInternal(e) => f.debug_tuple("TxnInternal").field(e).finish(),
         }
     }
 }
 
-impl<Pool: DieselPool> fmt::Display for FetchError<Pool> {
+impl std::fmt::Display for JobRunnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        <Self as std::fmt::Debug>::fmt(self, f)
+    }
+}
+
+impl std::error::Error for JobRunnerError {}
+
+/*
+impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             FetchError::NoDatabaseConnection(e) => {
@@ -103,7 +120,7 @@ impl<Pool: DieselPool> fmt::Display for FetchError<Pool> {
     }
 }
 
-impl<Pool: DieselPool> Error for FetchError<Pool> {
+impl Error for FetchError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             FetchError::NoDatabaseConnection(e) => Some(e),
@@ -112,7 +129,7 @@ impl<Pool: DieselPool> Error for FetchError<Pool> {
         }
     }
 }
-
+*/
 /// An error returned by `Runner::check_for_failed_jobs`. Only used in tests.
 #[derive(Debug)]
 pub enum FailedJobsError {
@@ -122,6 +139,8 @@ pub enum FailedJobsError {
         i64,
     ),
 
+    PanicOccurred,
+
     #[doc(hidden)]
     /// Match on `_` instead, more variants may be added in the future
     /// Some other error occurred. Worker threads may have panicked, an error
@@ -130,17 +149,27 @@ pub enum FailedJobsError {
     __Unknown(Box<dyn Error + Send + Sync>),
 }
 
-pub use FailedJobsError::JobsFailed;
-
 impl From<Box<dyn Error + Send + Sync>> for FailedJobsError {
     fn from(e: Box<dyn Error + Send + Sync>) -> Self {
         FailedJobsError::__Unknown(e)
     }
 }
 
+impl From<deadpool_diesel::PoolError> for FailedJobsError {
+    fn from(e: deadpool_diesel::PoolError) -> Self {
+        FailedJobsError::__Unknown(e.into())
+    }
+}
+
 impl From<DieselError> for FailedJobsError {
     fn from(e: DieselError) -> Self {
         FailedJobsError::__Unknown(e.into())
+    }
+}
+
+impl<T> From<std::sync::PoisonError<T>> for FailedJobsError {
+    fn from(_: PoisonError<T>) -> Self {
+        FailedJobsError::PanicOccurred
     }
 }
 
@@ -159,6 +188,7 @@ impl fmt::Display for FailedJobsError {
 
         match self {
             JobsFailed(x) => write!(f, "{} jobs failed", x),
+            PanicOccurred => write!(f, "A panic occurred while executing the job"),
             FailedJobsError::__Unknown(e) => e.fmt(f),
         }
     }
@@ -168,6 +198,7 @@ impl Error for FailedJobsError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             JobsFailed(_) => None,
+            PanicOccurred => None,
             FailedJobsError::__Unknown(e) => Some(&**e),
         }
     }

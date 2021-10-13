@@ -1,313 +1,362 @@
-use diesel::prelude::*;
-#[cfg(feature = "r2d2")]
-use diesel::r2d2;
-use std::any::Any;
-use std::error::Error;
-use std::panic::{catch_unwind, AssertUnwindSafe, PanicInfo, RefUnwindSafe, UnwindSafe};
+use std::panic::{AssertUnwindSafe, PanicInfo, RefUnwindSafe, UnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
-use threadpool::ThreadPool;
 
-use crate::db::*;
+use diesel::prelude::*;
+
+use crate::{DieselPool, Registry, storage};
 use crate::errors::*;
-use crate::{storage, Registry};
-use event::*;
-
-mod channel;
-mod event;
+use crate::registry::PerformJob;
+use diesel::connection::{AnsiTransactionManager, TransactionManager};
 
 pub struct NoConnectionPoolGiven;
 
 #[allow(missing_debug_implementations)]
-pub struct Builder<Env, ConnectionPoolBuilder> {
-    connection_pool_or_builder: ConnectionPoolBuilder,
+pub struct Builder<Env> {
+    connection_pool: deadpool_diesel::postgres::Pool,
     environment: Env,
-    thread_count: Option<usize>,
-    job_start_timeout: Option<Duration>,
+    concurrency: Option<usize>,
+    job_timeout: Option<Duration>,
+    max_retries: Option<usize>,
 }
 
-impl<Env, ConnectionPoolBuilder> Builder<Env, ConnectionPoolBuilder> {
+impl<Env> Builder<Env> {
     /// Set the number of threads to be used to run jobs concurrently.
     ///
     /// Defaults to 5
-    pub fn thread_count(mut self, thread_count: usize) -> Self {
-        self.thread_count = Some(thread_count);
+    pub fn concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = Some(concurrency);
         self
     }
 
-    fn get_thread_count(&self) -> usize {
-        self.thread_count.unwrap_or(5)
-    }
-
-    /// The amount of time to wait for a job to start before assuming an error
+    /// The amount of time to wait for a job to run before assuming an error
     /// has occurred.
     ///
-    /// Defaults to 10 seconds.
-    pub fn job_start_timeout(mut self, timeout: Duration) -> Self {
-        self.job_start_timeout = Some(timeout);
+    /// Defaults to 300 seconds (5 minutes).
+    pub fn job_timeout(mut self, timeout: Duration) -> Self {
+        self.job_timeout = Some(timeout);
         self
     }
 
-    /// Provide a connection pool to be used by the runner
-    pub fn connection_pool<NewPool>(self, pool: NewPool) -> Builder<Env, NewPool> {
-        Builder {
-            connection_pool_or_builder: pool,
-            environment: self.environment,
-            thread_count: self.thread_count,
-            job_start_timeout: self.job_start_timeout,
-        }
-    }
-}
-
-#[cfg(feature = "r2d2")]
-impl<Env, ConnectionPoolBuilder> Builder<Env, ConnectionPoolBuilder> {
-    /// Build the runner with an r2d2 connection pool
+    /// The maximum number of times to retry a job.
     ///
-    /// This will override any connection pool previously provided
-    pub fn database_url<S: Into<String>>(self, database_url: S) -> Builder<Env, R2d2Builder> {
-        self.connection_pool_builder(database_url, r2d2::Builder::new())
-    }
-
-    /// Provide a connection pool builder.
-    ///
-    /// This will override any connection pool previously provided.
-    ///
-    /// You should call this method if you want to provide additional
-    /// configuration for the database connection pool. The builder will be
-    /// configured to have its max size set to the value given to `2 * thread_count`.
-    /// To override this behavior, call [`connection_count`](Self::connection_count)
-    pub fn connection_pool_builder<S: Into<String>>(
-        self,
-        database_url: S,
-        builder: r2d2::Builder<r2d2::ConnectionManager<PgConnection>>,
-    ) -> Builder<Env, R2d2Builder> {
-        self.connection_pool(R2d2Builder::new(database_url.into(), builder))
-    }
-}
-
-#[cfg(feature = "r2d2")]
-impl<Env> Builder<Env, R2d2Builder> {
-    /// Set the max size of the database connection pool
-    pub fn connection_count(mut self, connection_count: u32) -> Self {
-        self.connection_pool_or_builder
-            .connection_count(connection_count);
+    /// Defaults to 4.
+    pub fn max_retries(mut self, max_retries: usize) -> Self {
+        self.max_retries = Some(max_retries);
         self
     }
+}
 
-    /// Build the runner with an r2d2 connection pool.
-    pub fn build(self) -> Runner<Env, r2d2::Pool<r2d2::ConnectionManager<PgConnection>>> {
-        let thread_count = self.get_thread_count();
-        let connection_pool_size = thread_count as u32 * 2;
-        let connection_pool = self.connection_pool_or_builder.build(connection_pool_size);
-
+impl<Env: UnwindSafe + Send> Builder<Env> {
+    /// Build the runner.
+    pub fn build(self) -> Runner<Env> {
         Runner {
-            connection_pool,
-            thread_pool: ThreadPool::new(thread_count),
+            connection_pool: self.connection_pool,
             environment: Arc::new(self.environment),
             registry: Arc::new(Registry::load()),
-            job_start_timeout: self.job_start_timeout.unwrap_or(Duration::from_secs(10)),
+            concurrency: self.concurrency.unwrap_or(5),
+            job_timeout: self.job_timeout.unwrap_or(Duration::from_secs(300)),
+            max_retries: self.max_retries.unwrap_or(4),
         }
     }
 }
 
-impl<Env, ConnectionPool> Builder<Env, ConnectionPool>
-where
-    ConnectionPool: DieselPool,
-{
-    /// Build the runner
-    pub fn build(self) -> Runner<Env, ConnectionPool> {
-        Runner {
-            thread_pool: ThreadPool::new(self.get_thread_count()),
-            connection_pool: self.connection_pool_or_builder,
-            environment: Arc::new(self.environment),
-            registry: Arc::new(Registry::load()),
-            job_start_timeout: self.job_start_timeout.unwrap_or(Duration::from_secs(10)),
-        }
-    }
+enum RunResult {
+    JobNotFound(String),
+    JobResult(Result<Result<Result<(), Result<Option<PerformError>, JobRunnerError>>, Box<dyn std::any::Any + Send>>, tokio::time::error::Elapsed>)
 }
 
 #[allow(missing_debug_implementations)]
-/// The core runner responsible for locking and running jobs
-pub struct Runner<Env: 'static, ConnectionPool> {
-    connection_pool: ConnectionPool,
-    thread_pool: ThreadPool,
+/// The core runner responsible for locking and running jobs.
+pub struct Runner<Env: UnwindSafe + Send + 'static> {
+    connection_pool: deadpool_diesel::postgres::Pool,
     environment: Arc<Env>,
     registry: Arc<Registry<Env>>,
-    job_start_timeout: Duration,
+    concurrency: usize,
+    job_timeout: Duration,
+    max_retries: usize,
 }
 
-impl<Env> Runner<Env, NoConnectionPoolGiven> {
-    /// Create a builder for a job runner
+impl<Env: UnwindSafe + Send> Runner<Env> {
+    /// Create a builder for a Runner.
     ///
-    /// This method takes the two required configurations, the database
-    /// connection pool, and the environment to pass to your jobs. If your
-    /// environment contains a connection pool, it should be the same pool given
-    /// here.
-    pub fn builder(environment: Env) -> Builder<Env, NoConnectionPoolGiven> {
+    /// This method takes the two required configurations: the database connection pool
+    /// and the environment to pass to jobs.
+    pub fn builder(
+        environment: Env,
+        connection_pool: deadpool_diesel::postgres::Pool,
+    ) -> Builder<Env> {
         Builder {
-            connection_pool_or_builder: NoConnectionPoolGiven,
+            connection_pool,
             environment,
-            thread_count: None,
-            job_start_timeout: None,
+            concurrency: None,
+            job_timeout: None,
+            max_retries: None,
         }
     }
 }
 
-impl<Env, ConnectionPool> Runner<Env, ConnectionPool> {
-    #[doc(hidden)]
-    /// For use in integration tests
-    pub fn connection_pool(&self) -> &ConnectionPool {
-        &self.connection_pool
-    }
-}
-
-impl<Env, ConnectionPool> Runner<Env, ConnectionPool>
+impl<Env> Runner<Env>
 where
-    Env: RefUnwindSafe + Send + Sync + 'static,
-    ConnectionPool: DieselPool + 'static,
+    Env: UnwindSafe + RefUnwindSafe + Send + Sync + 'static,
 {
-    /// Runs all pending jobs in the queue
-    ///
-    /// This function will return once all jobs in the queue have begun running,
-    /// but does not wait for them to complete. When this function returns, at
-    /// least one thread will have tried to acquire a new job, and found there
-    /// were none in the queue.
-    pub fn run_all_pending_jobs(&self) -> Result<(), FetchError<ConnectionPool>> {
-        use std::cmp::max;
+    /// Runs all pending jobs in the queue and continue to pick up and run jobs until an
+    /// error processing jobs occurs or until a job panics. This function does not stop
+    /// when a normal error occurs within the execution of a job.
+    pub async fn start(&self) -> Result<(), JobRunnerError> {
+        use futures::{stream::FuturesUnordered, StreamExt, FutureExt};
+        // use futures::FutureExt;
 
-        let max_threads = self.thread_pool.max_count();
-        let (sender, receiver) = channel::new(max_threads);
-        let mut pending_messages = 0;
+        let job_timeout = self.job_timeout.clone();
+        let max_retries = self.max_retries as i32;
+
+        let do_job = move |connection_pool: DieselPool,
+                           environment: Arc<Env>,
+                           registry: Arc<Registry<Env>>| {
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(Self::run_single_job(
+                    // job_timeout.clone(),
+                    max_retries,
+                    connection_pool,
+                    // environment,
+                    // registry,
+                    move |job| {
+                        // match registry.get(&job.job_type).ok_or_else(|| {
+                        //     // JobRunnerError::UnrecognizedJob(format!(
+                        //     //     "Unknown job type {} for job {}; it may be that different jobs have different environment types",
+                        //     //     job.job_type, job.id
+                        //     // ))
+                        //     Ok(
+                        //         Ok(
+                        //             JobRunnerError::UnrecognizedJob(format!(
+                        //                 "Unknown job type {} for job {}; it may be that different jobs have different environment types",
+                        //                 job.job_type, job.id
+                        //             ))
+                        //         )
+                        //     )
+                        // }) {
+                        //    Err(e) => {
+                        //        let _x: Result<Result<i32, ()>, ()> = e;
+                        //    }
+                        //     Ok(v) => {}
+                        // };
+                        // let perform_job: PerformJob<Env> = registry.get(&job.job_type).ok_or_else(|| -> Result<Result<Result<(), PerformError>, Box<dyn std::any::Any + Send>>, tokio::time::error::Elapsed> {
+                        //     // JobRunnerError::UnrecognizedJob(format!(
+                        //     //     "Unknown job type {} for job {}; it may be that different jobs have different environment types",
+                        //     //     job.job_type, job.id
+                        //     // ))
+                        //     Result::<_, tokio::time::error::Elapsed>::Ok(
+                        //         Ok(
+                        //         Err(JobRunnerError::UnrecognizedJob(format!(
+                        //             "Unknown job type {} for job {}; it may be that different jobs have different environment types",
+                        //             job.job_type, job.id
+                        //         )))
+                        //         )
+                        //     )
+                        // })?;
+                        let perform_job: PerformJob<Env> = registry.get(&job.job_type).ok_or_else(|| -> Result<Result<Result<(), PerformError>, Box<dyn std::any::Any + Send>>, tokio::time::error::Elapsed> {
+                            // JobRunnerError::UnrecognizedJob(format!(
+                            //     "Unknown job type {} for job {}; it may be that different jobs have different environment types",
+                            //     job.job_type, job.id
+                            // ))
+                            Result::<_, tokio::time::error::Elapsed>::Ok(
+                                Ok(
+                                    Err(JobRunnerError::UnrecognizedJob(format!(
+                                        "Unknown job type {} for job {}; it may be that different jobs have different environment types",
+                                        job.job_type, job.id
+                                    )))
+                                )
+                            )
+                        })?;
+                        // AssertUnwindSafe(perform_job.perform(
+                        //     job.data,
+                        //     &environment,
+                        //     connection_pool.clone(),
+                        // ))
+                        // perform_job.perform(
+                        //     job.data,
+                        //     &environment,
+                        //     connection_pool.clone(),
+                        // )
+                        // futures::executor::block_on(tokio::time::timeout(
+                        //     job_timeout,
+                        //     AssertUnwindSafe(perform_job.perform(
+                        //         job.data,
+                        //         &environment,
+                        //         connection_pool.clone(),
+                        //     ))
+                        //     .catch_unwind()
+                        // ))
+                        tokio::time::timeout(
+                            job_timeout,
+                            AssertUnwindSafe(perform_job.perform(
+                                job.data,
+                                &environment,
+                                connection_pool.clone(),
+                            ))
+                                .catch_unwind()
+                        )
+                        // )) {
+                    }
+                ))
+            })
+        };
+
+        let mut async_tasks = FuturesUnordered::new();
+
+        let mut err: Option<JobRunnerError> = None;
+
         loop {
-            let available_threads = max_threads - self.thread_pool.active_count();
+            let running_tasks = async_tasks.len();
 
-            let jobs_to_queue = if pending_messages == 0 {
-                // If we have no queued jobs talking to us, and there are no
-                // available threads, we still need to queue at least one job
-                // or we'll never receive a message
-                max(available_threads, 1)
-            } else {
-                available_threads
-            };
+            tokio::select! {
+                biased;
 
-            for _ in 0..jobs_to_queue {
-                self.run_single_job(sender.clone());
-            }
-
-            pending_messages += jobs_to_queue;
-            match receiver.recv_timeout(self.job_start_timeout) {
-                Ok(Event::Working) => pending_messages -= 1,
-                Ok(Event::NoJobAvailable) => return Ok(()),
-                Ok(Event::ErrorLoadingJob(e)) => return Err(FetchError::FailedLoadingJob(e)),
-                Ok(Event::FailedToAcquireConnection(e)) => {
-                    return Err(FetchError::NoDatabaseConnection(e));
+                _ = async {}, if err.is_some() && running_tasks == 0 => {
+                    eprintln!("Shutting down due to error");
+                    return Err(err.unwrap());
                 }
-                Err(_) => return Err(FetchError::NoMessageReceived),
+                _ = async {}, if err.is_none() && running_tasks < self.concurrency => {
+                    async_tasks.push(do_job(self.connection_pool.clone(), self.environment.clone(), self.registry.clone()));
+                }
+                job_run_res = async_tasks.select_next_some() => {
+                    // Don't start any more job executions if an error has occurred.
+                    match job_run_res {
+                        Err(join_err) => {
+                            err = Some(JobRunnerError::TaskExecutionFailed(join_err));
+                            async_tasks.push(do_job(self.connection_pool.clone(), self.environment.clone(), self.registry.clone()));
+                        }
+                        Ok(job_res) => {
+                            match job_res {
+                                Ok(_) => {
+                                    if err.is_none() {
+                                        async_tasks.push(do_job(self.connection_pool.clone(), self.environment.clone(), self.registry.clone()));
+                                    }
+                                },
+                                Err(e) => {
+                                    err = Some(e);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
+
+        // TODO: Catch CTRL+C and return Ok(())
     }
 
-    fn run_single_job(&self, sender: EventSender<ConnectionPool>) {
-        let environment = Arc::clone(&self.environment);
-        let registry = Arc::clone(&self.registry);
-        // FIXME: https://github.com/sfackler/r2d2/pull/70
-        let connection_pool = AssertUnwindSafe(self.connection_pool().clone());
-        self.get_single_job(sender, move |job| {
-            let perform_job = registry
-                .get(&job.job_type)
-                .ok_or_else(|| PerformError::from(format!("Unknown job type {}", job.job_type)))?;
-            perform_job.perform(job.data, &environment, &connection_pool.0)
-        })
-    }
-
-    fn get_single_job<F>(&self, sender: EventSender<ConnectionPool>, f: F)
+    async fn run_single_job<F>(
+        max_retries: i32,
+        connection_pool: DieselPool,
+        job_fn: F,
+    ) -> Result<(), JobRunnerError>
     where
-        F: FnOnce(storage::BackgroundJob) -> Result<(), PerformError> + Send + UnwindSafe + 'static,
+        // F: FnOnce(storage::BackgroundJob) -> Result<Result<Result<(), Result<Option<PerformError>, JobRunnerError>>, Box<dyn std::any::Any + Send>>, tokio::time::error::Elapsed> + 'static,
+        F: FnOnce(storage::BackgroundJob) -> RunResult + 'static,
     {
-        use diesel::result::Error::RollbackTransaction;
+        let conn_wrapper = match connection_pool.get().await {
+            Ok(cw) => cw,
+            Err(e) => {
+                return Err(JobRunnerError::FailedToAcquireConnection(e));
+            }
+        };
 
-        // The connection may not be `Send` so we need to clone the pool instead
-        let pool = self.connection_pool.clone();
-        self.thread_pool.execute(move || {
-            let conn = match pool.get() {
-                Ok(conn) => conn,
+        let mut conn: &mut PgConnection = match conn_wrapper.lock() {
+            Ok(conn) => conn,
+            Err(_e) => {
+                return Err(JobRunnerError::FailedToAcquireConnection(
+                    deadpool_diesel::PoolError::Closed,
+                ));
+            }
+        };
+
+        AnsiTransactionManager::begin_transaction(&mut conn)
+        // conn.execute("BEGIN")
+            .map_err(|| {
+                todo!()
+            })?;
+
+        // conn.transaction::<(), JobRunnerError, _>(|conn| {
+            let job = match storage::find_next_unlocked_job(conn, max_retries).optional() {
+                Ok(Some(j)) => j,
+                Ok(None) => {
+                    AnsiTransactionManager::commit_transaction(&mut conn)
+                        .map_err(|| {
+                            todo!()
+                        })?;
+                    // TODO: Make this sleep time configurable.
+                    std::thread::sleep(Duration::from_secs(2));
+                    return Ok(());
+                }
                 Err(e) => {
-                    sender.send(Event::FailedToAcquireConnection(e));
-                    return;
+                    AnsiTransactionManager::rollback_transaction(&mut conn)
+                        .map_err(|| {
+                            todo!()
+                        })?;
+                    return Err(JobRunnerError::ErrorLoadingJob(e));
                 }
             };
 
-            let job_run_result = conn.transaction::<_, diesel::result::Error, _>(|| {
-                let job = match storage::find_next_unlocked_job(&conn).optional() {
-                    Ok(Some(j)) => {
-                        sender.send(Event::Working);
-                        j
-                    }
-                    Ok(None) => {
-                        sender.send(Event::NoJobAvailable);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        sender.send(Event::ErrorLoadingJob(e));
-                        return Err(RollbackTransaction);
-                    }
-                };
-                let job_id = job.id;
+            let job_id = job.id.clone();
 
-                let result = catch_unwind(|| f(job))
-                    .map_err(|e| try_to_extract_panic_info(&e))
-                    .and_then(|r| r);
+            // let perform_job: PerformJob<Env> = registry.get(&job.job_type).ok_or_else(|| {
+            //     JobRunnerError::UnrecognizedJob(format!(
+            //         "Unknown job type {} for job {}; it may be that different jobs have different environment types",
+            //         job.job_type, job_id
+            //     ))
+            // })?;
 
-                match result {
-                    Ok(_) => storage::delete_successful_job(&conn, job_id)?,
-                    Err(e) => {
-                        eprintln!("Job {} failed to run: {}", job_id, e);
-                        storage::update_failed_job(&conn, job_id);
-                    }
+            // We don't have a guarantee that the Pool ends up in an internally consistent state
+            // after the function that it's passed to panics (i.e., that it is UnwindSafe). Even if
+            // it is already safe, we err on the side of caution and deliberately stop processing
+            // new jobs whenever a panic occurs.
+
+            let retries = job.retries;
+
+            // match futures::executor::block_on(tokio::time::timeout(
+            //     timeout,
+            //     // AssertUnwindSafe(perform_job.perform(
+            //     //     job.data,
+            //     //     &environment,
+            //     //     connection_pool.clone(),
+            //     // ))
+            //     f(job)
+            //     .catch_unwind(),
+            // )) {
+            match job_fn(job) {
+                Err(_) => {
+                    eprintln!("Job {} timed out", job_id);
+                    storage::update_failed_job(conn, &job_id, retries, max_retries);
+                    Ok(())
                 }
-                Ok(())
-            });
-
-            match job_run_result {
-                Ok(_) | Err(RollbackTransaction) => {}
-                Err(e) => {
-                    panic!("Failed to update job: {:?}", e);
+                Ok(perform_res) => {
+                    match perform_res {
+                        Ok(res) => {
+                            if let Err(_) = res {
+                                eprintln!("Job {} failed", job_id);
+                                storage::update_failed_job(conn, &job_id, retries, max_retries);
+                            } else {
+                                if let Err(e) = storage::update_successful_job(conn, &job_id) {
+                                    eprintln!(
+                                        "Could not update job {} as succeeded: {}",
+                                        job_id, e
+                                    );
+                                }
+                            }
+                            Ok(())
+                        }
+                        Err(e) => {
+                            // Panic occurred. No more jobs will be started.
+                            let err_message = try_to_extract_panic_info(&e);
+                            eprintln!("Job {} panicked: {:?}", job_id, err_message);
+                            storage::update_failed_job(conn, &job_id, retries, max_retries);
+                            Err(JobRunnerError::PanicOccurred(err_message))
+                        }
+                    }
                 }
             }
-        })
-    }
-
-    fn connection(&self) -> Result<DieselPooledConn<ConnectionPool>, Box<dyn Error + Send + Sync>> {
-        self.connection_pool.get().map_err(Into::into)
-    }
-
-    /// Waits for all running jobs to complete, and returns an error if any
-    /// failed
-    ///
-    /// This function is intended for use in tests. If any jobs have failed, it
-    /// will return `swirl::JobsFailed` with the number of jobs that failed.
-    ///
-    /// If any other unexpected errors occurred, such as panicked worker threads
-    /// or an error loading the job count from the database, an opaque error
-    /// will be returned.
-    pub fn check_for_failed_jobs(&self) -> Result<(), FailedJobsError> {
-        self.wait_for_jobs()?;
-        let failed_jobs = storage::failed_job_count(&*self.connection()?)?;
-        if failed_jobs == 0 {
-            Ok(())
-        } else {
-            Err(JobsFailed(failed_jobs))
-        }
-    }
-
-    fn wait_for_jobs(&self) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.thread_pool.join();
-        let panic_count = self.thread_pool.panic_count();
-        if panic_count == 0 {
-            Ok(())
-        } else {
-            Err(format!("{} threads panicked", panic_count).into())
-        }
+        // })
     }
 }
 
@@ -317,27 +366,28 @@ where
 /// However, the `panic::set_hook` functions deal with a `PanicInfo` type, and its payload is
 /// documented as "commonly but not always `&'static str` or `String`". So we can try all of those,
 /// and give up if we didn't get one of those three types.
-fn try_to_extract_panic_info(info: &(dyn Any + Send + 'static)) -> PerformError {
+fn try_to_extract_panic_info(info: &(dyn std::any::Any + Send + 'static)) -> PerformError {
     if let Some(x) = info.downcast_ref::<PanicInfo>() {
-        format!("job panicked: {}", x).into()
+        format!("job panicked: {}", x)
     } else if let Some(x) = info.downcast_ref::<&'static str>() {
-        format!("job panicked: {}", x).into()
+        format!("job panicked: {}", x)
     } else if let Some(x) = info.downcast_ref::<String>() {
-        format!("job panicked: {}", x).into()
+        format!("job panicked: {}", x)
     } else {
-        "job panicked".into()
+        String::from("job panicked")
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::panic::AssertUnwindSafe;
+    use std::sync::{Barrier, Mutex, MutexGuard};
+
     use diesel::prelude::*;
-    use diesel::r2d2;
+
+    use crate::schema::background_jobs::dsl::*;
 
     use super::*;
-    use crate::schema::background_jobs::dsl::*;
-    use std::panic::AssertUnwindSafe;
-    use std::sync::{Arc, Barrier, Mutex, MutexGuard};
 
     #[test]
     fn jobs_are_locked_when_fetched() {
@@ -351,12 +401,9 @@ mod tests {
         let return_barrier = Arc::new(AssertUnwindSafe(Barrier::new(2)));
         let return_barrier2 = return_barrier.clone();
 
-        runner.get_single_job(channel::dummy_sender(), move |job| {
-            fetch_barrier.0.wait(); // Tell thread 2 it can lock its job
-            assert_eq!(first_job_id, job.id);
-            return_barrier.0.wait(); // Wait for thread 2 to lock its job
-            Ok(())
-        });
+        let pool = db_pool();
+
+        Runner::run_single_job(std::time::Duration::from_secs(10), 3, pool, Arc::new(()), todo!());
 
         fetch_barrier2.0.wait(); // Wait until thread 1 locks its job
         runner.get_single_job(channel::dummy_sender(), move |job| {
@@ -368,6 +415,7 @@ mod tests {
         runner.wait_for_jobs().unwrap();
     }
 
+    /*
     #[test]
     fn jobs_are_deleted_when_successfully_run() {
         let _guard = TestGuard::lock();
@@ -378,9 +426,9 @@ mod tests {
         runner.get_single_job(channel::dummy_sender(), |_| Ok(()));
         runner.wait_for_jobs().unwrap();
 
-        let remaining_jobs = background_jobs
-            .count()
-            .get_result(&*runner.connection().unwrap());
+        let mut conn: PgConnection =
+            runner.connection_pool.get().await.unwrap().lock().unwrap().deref_mut();
+        let remaining_jobs = background_jobs.count().get_result(&mut conn);
         assert_eq!(Ok(0), remaining_jobs);
     }
 
@@ -399,7 +447,9 @@ mod tests {
             Err("nope".into())
         });
 
-        let conn = runner.connection().unwrap();
+        let mut conn: PgConnection =
+            runner.connection_pool.get().await.unwrap().lock().unwrap().deref_mut();
+
         // Wait for the first thread to acquire the lock
         barrier2.0.wait();
         // We are intentionally not using `get_single_job` here.
@@ -416,11 +466,8 @@ mod tests {
         assert_eq!(0, available_jobs.len());
 
         // Sanity check to make sure the job actually is there
-        let total_jobs_including_failed = background_jobs
-            .select(id)
-            .for_update()
-            .load::<i64>(&*conn)
-            .unwrap();
+        let total_jobs_including_failed =
+            background_jobs.select(id).for_update().load::<i64>(&*conn).unwrap();
         assert_eq!(1, total_jobs_including_failed.len());
 
         runner.wait_for_jobs().unwrap();
@@ -435,6 +482,16 @@ mod tests {
         runner.get_single_job(channel::dummy_sender(), |_| panic!());
         runner.wait_for_jobs().unwrap();
 
+        let mut conn: PgConnection = runner
+            .connection_pool
+            .get()
+            .await
+            .map_err(Into::into)
+            .unwrap()
+            .lock()
+            .map_err(Into::into)
+            .unwrap()
+            .deref_mut();
         let tries = background_jobs
             .find(job_id)
             .select(retries)
@@ -443,6 +500,7 @@ mod tests {
             .unwrap();
         assert_eq!(1, tries);
     }
+     */
 
     lazy_static::lazy_static! {
         // Since these tests deal with behavior concerning multiple connections
@@ -464,29 +522,44 @@ mod tests {
 
     impl<'a> Drop for TestGuard<'a> {
         fn drop(&mut self) {
+            let db_url = dotenv::var("TEST_DATABASE_URL")
+                .expect("TEST_DATABASE_URL must be set to run tests");
+            let mut conn = PgConnection::establish(&db_url).unwrap();
             ::diesel::sql_query("TRUNCATE TABLE background_jobs")
-                .execute(&*runner().connection().unwrap())
+                .execute(&mut conn)
                 .unwrap();
         }
     }
 
-    type Runner<Env> = crate::Runner<Env, r2d2::Pool<r2d2::ConnectionManager<PgConnection>>>;
-
-    fn runner() -> Runner<()> {
+    fn db_pool() -> DieselPool {
         let database_url =
             dotenv::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set to run tests");
 
-        crate::Runner::builder(())
-            .database_url(database_url)
-            .thread_count(2)
+        let pool_manager = deadpool_diesel::postgres::Manager::new(
+            &database_url,
+            deadpool_diesel::Runtime::Tokio1,
+        );
+
+        deadpool_diesel::postgres::Pool::builder(pool_manager)
+            .max_size(3)
             .build()
+            .unwrap()
     }
 
-    fn create_dummy_job(runner: &Runner<()>) -> storage::BackgroundJob {
+    fn runner() -> Runner<()> {
+        Runner::builder((), db_pool()).concurrency(2).build()
+    }
+
+    fn create_dummy_job(runner: &Runner<()>, db_conn: &mut PgConnection) -> storage::BackgroundJob {
         ::diesel::insert_into(background_jobs)
-            .values((job_type.eq("Foo"), data.eq(serde_json::json!(null))))
+            .values((
+                id.eq(min_id::generate_id()),
+                job_type.eq("Foo"),
+                data.eq(serde_json::json!(null)),
+                status.eq("Queued"),
+            ))
             .returning((id, job_type, data))
-            .get_result(&*runner.connection().unwrap())
+            .get_result(db_conn)
             .unwrap()
     }
 }

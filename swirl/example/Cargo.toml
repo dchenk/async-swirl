@@ -1,0 +1,13 @@
+cargo-features = ["edition2021"]
+
+[package]
+name = "swirl-example"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+deadpool-diesel = { git = "https://github.com/dchenk/deadpool", rev = "01c0c916f36598d8d046933cf9ab435009018e47", features = ["postgres"] }
+diesel = { git = "https://github.com/diesel-rs/diesel", rev = "6eae69f3e60b45c383927336b48b6ee860a71e00", features = ["postgres", "serde_json"] }
+dotenv = "0.15"
+swirl = { path = "../../swirl" }
+tokio = { version = "1.11", features = ["macros", "rt-multi-thread"] }

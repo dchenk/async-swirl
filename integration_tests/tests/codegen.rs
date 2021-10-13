@@ -2,7 +2,6 @@ use crate::dummy_jobs::*;
 use crate::test_guard::TestGuard;
 use diesel::prelude::*;
 use failure::Fallible;
-use swirl::db::DieselPoolObj;
 use swirl::{JobsFailed, PerformError};
 
 #[test]
@@ -21,7 +20,7 @@ fn generated_jobs_serialize_all_arguments_except_first() -> Fallible<()> {
     check_arg_equal_to_env("a".into()).enqueue(&conn)?;
     check_arg_equal_to_env("b".into()).enqueue(&conn)?;
 
-    runner.run_all_pending_jobs()?;
+    runner.start()?;
     assert_eq!(Err(JobsFailed(1)), runner.check_for_failed_jobs());
     Ok(())
 }
@@ -42,7 +41,7 @@ fn jobs_with_args_but_no_env() -> Fallible<()> {
     assert_foo("foo".into()).enqueue(&conn)?;
     assert_foo("not foo".into()).enqueue(&conn)?;
 
-    runner.run_all_pending_jobs()?;
+    runner.start()?;
     assert_eq!(Err(JobsFailed(1)), runner.check_for_failed_jobs());
     Ok(())
 }
@@ -59,7 +58,7 @@ fn env_can_have_any_name() -> Fallible<()> {
     let conn = runner.connection_pool().get()?;
     env_with_different_name().enqueue(&conn)?;
 
-    runner.run_all_pending_jobs()?;
+    runner.start()?;
     runner.check_for_failed_jobs()?;
     Ok(())
 }
@@ -82,50 +81,53 @@ fn test_imports_only_used_in_job_body_are_not_warned_as_unused() -> Fallible<()>
     let conn = runner.connection_pool().get()?;
     uses_trait_import().enqueue(&conn)?;
 
-    runner.run_all_pending_jobs()?;
+    runner.start()?;
     runner.check_for_failed_jobs()?;
     Ok(())
 }
 
 #[test]
 fn jobs_can_take_a_connection_as_an_argument() -> Fallible<()> {
+    use deadpool_diesel::postgres::Pool;
     use diesel::sql_query;
 
     #[swirl::background_job]
-    fn takes_env_and_conn(_env: &(), conn: &PgConnection) -> Result<(), swirl::PerformError> {
+    fn takes_env_and_conn(_env: &(), conn: &mut PgConnection) -> Result<(), swirl::PerformError> {
         sql_query("SELECT 1").execute(conn)?;
         Ok(())
     }
 
     #[swirl::background_job]
-    fn takes_only_conn(conn: &PgConnection) -> Result<(), swirl::PerformError> {
+    fn takes_only_conn(conn: &mut PgConnection) -> Result<(), swirl::PerformError> {
         sql_query("SELECT 1").execute(conn)?;
         Ok(())
     }
 
     #[swirl::background_job]
-    fn takes_connection_pool(pool: &dyn DieselPoolObj) -> Result<(), swirl::PerformError> {
-        let conn1 = pool.get()?;
-        let conn2 = pool.get()?;
-        sql_query("SELECT 1").execute(&**conn1)?;
-        sql_query("SELECT 1").execute(&**conn2)?;
+    fn takes_connection_pool(pool: Pool) -> Result<(), swirl::PerformError> {
+        let mut conn1: PgConnection = pool.get().await.unwrap().lock().unwrap().deref_mut();
+        let mut conn2: PgConnection = pool.get().await.unwrap().lock().unwrap().deref_mut();
+        sql_query("SELECT 1").execute(&mut conn1)?;
+        sql_query("SELECT 1").execute(&mut conn2)?;
         Ok(())
     }
 
     #[swirl::background_job]
-    fn takes_fully_qualified_conn(conn: &diesel::PgConnection) -> Result<(), swirl::PerformError> {
+    fn takes_fully_qualified_conn(
+        conn: &mut diesel::PgConnection,
+    ) -> Result<(), swirl::PerformError> {
         sql_query("SELECT 1").execute(conn)?;
         Ok(())
     }
 
     #[swirl::background_job]
     fn takes_fully_qualified_pool(
-        pool: &dyn swirl::db::DieselPoolObj,
+        pool: deadpool_diesel::postgres::Pool,
     ) -> Result<(), swirl::PerformError> {
-        let conn1 = pool.get()?;
-        let conn2 = pool.get()?;
-        sql_query("SELECT 1").execute(&**conn1)?;
-        sql_query("SELECT 1").execute(&**conn2)?;
+        let mut conn1: PgConnection = pool.get().await.unwrap().lock().unwrap().deref_mut();
+        let mut conn2: PgConnection = pool.get().await.unwrap().lock().unwrap().deref_mut();
+        sql_query("SELECT 1").execute(&mut conn1)?;
+        sql_query("SELECT 1").execute(&mut conn2)?;
         Ok(())
     }
 
@@ -139,7 +141,7 @@ fn jobs_can_take_a_connection_as_an_argument() -> Fallible<()> {
         takes_fully_qualified_pool().enqueue(&conn)?;
     }
 
-    runner.run_all_pending_jobs()?;
+    runner.start()?;
     runner.check_for_failed_jobs()?;
     Ok(())
 }

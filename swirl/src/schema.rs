@@ -1,10 +1,11 @@
 table! {
     background_jobs (id) {
-        id -> Int8,
+        id -> Text,
         job_type -> Text,
         data -> Jsonb,
+        status -> Text,
         retries -> Int4,
-        last_retry -> Timestamp,
+        last_retry_at -> Nullable<Timestamp>,
         created_at -> Timestamp,
     }
 }

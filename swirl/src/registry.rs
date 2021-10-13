@@ -3,8 +3,8 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::panic::UnwindSafe;
 
-use crate::db::DieselPoolObj;
 use crate::errors::PerformError;
 use crate::Job;
 
@@ -12,31 +12,38 @@ use crate::Job;
 #[allow(missing_debug_implementations)] // Can't derive debug
 /// A registry of background jobs, used to map job types to concrete perform
 /// functions at runtime.
-pub struct Registry<Env> {
+pub struct Registry<Env: UnwindSafe + Send + 'static> {
     jobs: HashMap<&'static str, JobVTable>,
     _marker: PhantomData<Env>,
 }
 
-impl<Env: 'static> Registry<Env> {
+impl<Env: UnwindSafe + Send + 'static> Registry<Env> {
     /// Loads the registry from all invocations of [`register_job!`] for this
     /// environment type
     pub fn load() -> Self {
         let jobs = inventory::iter::<JobVTable>
             .into_iter()
-            .filter(|vtable| vtable.env_type == TypeId::of::<Env>())
-            .map(|&vtable| (vtable.job_type, vtable))
+            .filter(|vtable| {
+                if vtable.env_type == TypeId::of::<Env>() {
+                    true
+                } else {
+                    eprintln!("Job type {} has an unrecognized Environment type", vtable.job_type);
+                    false
+                }
+            })
+            .map(|vtable| (vtable.job_type, vtable.clone()))
             .collect();
 
         Self {
-            jobs: jobs,
+            jobs,
             _marker: PhantomData,
         }
     }
 
     /// Get the perform function for a given job type
     pub fn get(&self, job_type: &str) -> Option<PerformJob<Env>> {
-        self.jobs.get(job_type).map(|&vtable| PerformJob {
-            vtable,
+        self.jobs.get(job_type).map(|vtable| PerformJob {
+            vtable: vtable.clone(),
             _marker: PhantomData,
         })
     }
@@ -55,52 +62,59 @@ macro_rules! register_job {
 }
 
 #[doc(hidden)]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct JobVTable {
     env_type: TypeId,
     job_type: &'static str,
-    perform: fn(serde_json::Value, &dyn Any, &dyn DieselPoolObj) -> Result<(), PerformError>,
+    perform: fn(
+        serde_json::Value,
+        &dyn Any,
+        deadpool_diesel::postgres::Pool,
+    ) -> futures::future::BoxFuture<'_, Result<(), PerformError>>,
 }
 
 inventory::collect!(JobVTable);
 
 impl JobVTable {
-    pub fn from_job<T: Job>() -> Self {
+    pub fn from_job<T: Job + Send + Sync + 'static>() -> Self {
         Self {
             env_type: TypeId::of::<T::Environment>(),
             job_type: T::JOB_TYPE,
-            perform: perform_job::<T>,
+            perform: move |d, e, p| {
+                let env_opt: Option<&T::Environment> = e.downcast_ref();
+                Box::pin(perform_job::<T>(d, env_opt, p))
+            },
         }
     }
 }
 
-fn perform_job<T: Job>(
+async fn perform_job<T: Job>(
     data: serde_json::Value,
-    env: &dyn Any,
-    pool: &dyn DieselPoolObj,
+    env: Option<&T::Environment>,
+    pool: deadpool_diesel::postgres::Pool,
 ) -> Result<(), PerformError> {
-    let environment = env.downcast_ref().ok_or_else::<PerformError, _>(|| {
+    let environment = env.ok_or_else::<PerformError, _>(|| {
         "Incorrect environment type. This should never happen. \
-         Please open an issue at https://github.com/sgrif/swirl/issues/new"
+             Please open an issue at https://github.com/dchenk/async-swirl/issues/new"
             .into()
     })?;
-    let data = serde_json::from_value(data)?;
-    T::perform(data, environment, pool)
+    let data = serde_json::from_value(data).map_err(|e| format!("{:?}", e))?;
+    T::perform(data, environment, pool).await
 }
 
-pub struct PerformJob<Env> {
+pub struct PerformJob<Env: UnwindSafe> {
     vtable: JobVTable,
     _marker: PhantomData<Env>,
 }
 
-impl<Env: 'static> PerformJob<Env> {
-    pub fn perform(
+impl<Env: UnwindSafe + Send + Sync + 'static> PerformJob<Env> {
+    pub async fn perform(
         &self,
         data: serde_json::Value,
         env: &Env,
-        pool: &dyn DieselPoolObj,
+        pool: deadpool_diesel::postgres::Pool,
     ) -> Result<(), PerformError> {
         let perform_fn = self.vtable.perform;
-        perform_fn(data, env, pool)
+        perform_fn(data, env, pool).await
     }
 }

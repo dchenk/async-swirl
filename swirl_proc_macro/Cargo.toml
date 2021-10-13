@@ -1,10 +1,12 @@
+cargo-features = ["edition2021"]
+
 [package]
 name = "swirl_proc_macro"
 version = "0.1.0"
 authors = ["Sean Griffin <sean@seantheprogrammer.com>"]
 description = "This library should not be used directly, it is re-exported through swirl"
 license = "MIT OR Apache-2.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
 syn = { version = "1.0", features = ["full", "extra-traits"] }

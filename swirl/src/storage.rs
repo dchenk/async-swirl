@@ -1,70 +1,103 @@
-use diesel::dsl::now;
-use diesel::pg::Pg;
 use diesel::prelude::*;
-use diesel::sql_types::{Bool, Integer, Interval};
-use diesel::{delete, insert_into, update};
+use diesel::sql_types;
+use diesel::{insert_into, update};
 use serde_json;
 
 use crate::errors::EnqueueError;
 use crate::schema::background_jobs;
+use crate::serde::__private::Formatter;
 use crate::Job;
 
-#[derive(Queryable, Identifiable, Debug, Clone)]
+#[derive(Debug)]
+pub enum JobStatus {
+    Queued,
+    Succeeded,
+    FailedReQueued,
+    Failed,
+}
+
+impl std::fmt::Display for JobStatus {
+    fn fmt(&self, f: &mut Formatter<'_>) -> serde::__private::fmt::Result {
+        match self {
+            JobStatus::Queued => write!(f, "Queued"),
+            JobStatus::Succeeded => write!(f, "Succeeded"),
+            JobStatus::FailedReQueued => write!(f, "FailedReQueued"),
+            JobStatus::Failed => write!(f, "Failed"),
+        }
+    }
+}
+
+#[derive(Queryable, Selectable, Debug, Clone)]
 pub struct BackgroundJob {
-    pub id: i64,
+    pub id: String,
     pub job_type: String,
     pub data: serde_json::Value,
+    pub retries: i32,
+}
+
+#[derive(Queryable, Insertable, Debug, Clone)]
+#[table_name = "background_jobs"]
+pub struct NewBackgroundJob {
+    pub id: String,
+    pub job_type: String,
+    pub data: serde_json::Value,
+    pub status: String,
 }
 
 /// Enqueues a job to be run as soon as possible.
-pub fn enqueue_job<T: Job>(conn: &PgConnection, job: T) -> Result<(), EnqueueError> {
+pub fn enqueue_job<T: Job>(conn: &mut PgConnection, job: T) -> Result<(), EnqueueError> {
     use crate::schema::background_jobs::dsl::*;
 
     let job_data = serde_json::to_value(job)?;
     insert_into(background_jobs)
-        .values((job_type.eq(T::JOB_TYPE), data.eq(job_data)))
+        .values(NewBackgroundJob {
+            id: min_id::generate_id(),
+            job_type: T::JOB_TYPE.to_owned(),
+            data: job_data,
+            status: JobStatus::Queued.to_string(),
+        })
         .execute(conn)?;
     Ok(())
 }
 
-fn retriable() -> Box<dyn BoxableExpression<background_jobs::table, Pg, SqlType = Bool>> {
-    use crate::schema::background_jobs::dsl::*;
-    use diesel::dsl::*;
+/// Finds the next job that is unlocked and ready to be retried. If a row is
+/// found, it gets locked.
+pub fn find_next_unlocked_job(
+    conn: &mut PgConnection,
+    max_retries: i32,
+) -> QueryResult<BackgroundJob> {
+    use crate::schema::background_jobs::dsl;
+    use diesel::dsl::{now, IntervalDsl};
 
-    sql_function!(fn power(x: Integer, y: Integer) -> Integer);
+    sql_function!(fn power(x: sql_types::Integer, y: sql_types::Integer) -> sql_types::Integer);
+    sql_function!(fn to_timestamp(x: sql_types::Integer) -> sql_types::Timestamp);
+    sql_function!(fn coalesce(x: sql_types::Nullable<sql_types::Timestamp>, y: sql_types::Timestamp) -> sql_types::Timestamp);
 
-    Box::new(last_retry.lt(now - 1.minute().into_sql::<Interval>() * power(2, retries)))
-}
-
-/// Finds the next job that is unlocked, and ready to be retried. If a row is
-/// found, it will be locked.
-pub fn find_next_unlocked_job(conn: &PgConnection) -> QueryResult<BackgroundJob> {
-    use crate::schema::background_jobs::dsl::*;
-
-    background_jobs
-        .select((id, job_type, data))
-        .filter(retriable())
-        .order(id)
+    dsl::background_jobs
+        .select(BackgroundJob::as_select())
+        .filter(dsl::status.eq_any(vec![
+            JobStatus::Queued.to_string(),
+            JobStatus::FailedReQueued.to_string(),
+        ]))
+        .filter(dsl::retries.lt(max_retries))
+        .filter(
+            dsl::last_retry_at.is_null().or(coalesce(dsl::last_retry_at, to_timestamp(0))
+                .lt(now - 1.minute().into_sql::<sql_types::Interval>() * power(2, dsl::retries))),
+        )
+        .order(dsl::created_at)
         .for_update()
         .skip_locked()
         .first::<BackgroundJob>(conn)
 }
 
-/// The number of jobs that have failed at least once
-pub fn failed_job_count(conn: &PgConnection) -> QueryResult<i64> {
-    use crate::schema::background_jobs::dsl::*;
+/// Updates the status of a job that has successfully completed running.
+pub fn update_successful_job(conn: &mut PgConnection, job_id: &String) -> QueryResult<()> {
+    use crate::schema::background_jobs::dsl;
 
-    background_jobs
-        .count()
-        .filter(retries.gt(0))
-        .get_result(conn)
-}
+    update(dsl::background_jobs.find(job_id))
+        .set(dsl::status.eq(JobStatus::Succeeded.to_string()))
+        .execute(conn)?;
 
-/// Deletes a job that has successfully completed running
-pub fn delete_successful_job(conn: &PgConnection, job_id: i64) -> QueryResult<()> {
-    use crate::schema::background_jobs::dsl::*;
-
-    delete(background_jobs.find(job_id)).execute(conn)?;
     Ok(())
 }
 
@@ -72,10 +105,26 @@ pub fn delete_successful_job(conn: &PgConnection, job_id: i64) -> QueryResult<()
 ///
 /// Ignores any database errors that may have occurred. If the DB has gone away,
 /// we assume that just trying again with a new connection will succeed.
-pub fn update_failed_job(conn: &PgConnection, job_id: i64) {
-    use crate::schema::background_jobs::dsl::*;
+pub fn update_failed_job(
+    conn: &mut PgConnection,
+    job_id: &String,
+    job_retries: i32,
+    max_retries: i32,
+) {
+    use crate::schema::background_jobs::dsl;
+    use diesel::dsl::now;
 
-    let _ = update(background_jobs.find(job_id))
-        .set((retries.eq(retries + 1), last_retry.eq(now)))
+    let status = if job_retries >= max_retries {
+        JobStatus::Failed.to_string()
+    } else {
+        JobStatus::FailedReQueued.to_string()
+    };
+
+    let _ = update(dsl::background_jobs.find(job_id))
+        .set((
+            dsl::status.eq(status),
+            dsl::retries.eq(dsl::retries + 1),
+            dsl::last_retry_at.eq(now),
+        ))
         .execute(conn);
 }
